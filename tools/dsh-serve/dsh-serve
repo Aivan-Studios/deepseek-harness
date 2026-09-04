@@ -3709,8 +3709,9 @@ def main() -> int:
                         default=VRAM_RETURN_TIMEOUT_S, metavar="SECS")
     vision.add_argument("--uds", action="store_true",
                         help="run the ATTEMPT with vLLM on a Unix socket behind "
-                             "this launcher's TCP proxy. The restore is always "
-                             "text-only direct TCP regardless")
+                             "this launcher's TCP proxy. The restore, if it "
+                             "happens, always uses --uds regardless of this "
+                             "value")
     vision.add_argument("--model", metavar="PROFILE",
                         help="a profile name from the model register for the "
                              "ATTEMPT only (`dsh-serve models` lists them). "
