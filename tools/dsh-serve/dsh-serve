@@ -2006,26 +2006,31 @@ def restore_known_good(args: argparse.Namespace, why: str) -> int:
     both name the shipped port, and neither is updated by this script.
 
     ⛔ KNOWN GOOD is defined as: the register's `KNOWN_GOOD_PROFILE`, text-only,
-    direct TCP, no proxy, no experiment arguments, on `--restore-port`. That is
-    the exact configuration the operator has been served by, and the only one
-    with a record of coming up.
+    `--uds`, no experiment arguments, on `--restore-port`. That is the exact
+    configuration the operator has been served by, and the only one with a
+    record of coming up. `--uds` only changes the internal transport to the
+    engine; the client-visible port and interface are unchanged.
 
     ⛔ The profile is `KNOWN_GOOD_PROFILE` from the register, NEVER `args.model`
     — the defect this closes (2026-08-30): a restore that re-read whatever
     profile the failed attempt used could retry the exact broken checkpoint
     it exists to fall back FROM. `start_namespace`'s `model` keyword is
     required specifically so this call cannot silently default to `args.model`
-    by omission. The restore also never inherits `--uds` from the attempt,
-    because a restore into an unproven path is not a restore.
+    by omission. The restore also never inherits `--uds` from the attempt —
+    it is hardcoded `True` here regardless of what the attempt used. Flipped
+    2026-09-04 from hardcoded `False`: six classified restores showed direct
+    TCP reachable in 4/6 (one confirmed unreachable, one very-likely) against
+    `--uds`'s 13/13 over the same history, so direct TCP stopped being the
+    more-proven path the original hardcoding relied on.
     """
     known_good = load_register()["KNOWN_GOOD_PROFILE"]
     say(f"RESTORING the known-good server ({known_good}) on port "
-        f"{args.restore_port} — text-only, direct TCP, no proxy ({why})")
+        f"{args.restore_port} — text-only, --uds ({why})")
     if not stop_running("clearing the failed vision attempt", STOP_WAIT_S):
         say("RESTORE BLOCKED: the failed server would not give the card back. "
             "The lease is deliberately still held. Investigate before retrying.")
         return RC_RESTORE_FAILED
-    restore = start_namespace(args, [], args.restore_timeout, uds=False,
+    restore = start_namespace(args, [], args.restore_timeout, uds=True,
                               model=known_good)
     restore.port = args.restore_port
     rc = cmd_start(restore)
@@ -2094,7 +2099,7 @@ def cmd_try_vision(args: argparse.Namespace) -> int:
         say(f"experiment arguments on the attempt only: {' '.join(args.vllm_args)}")
     if args.uds:
         say("attempt serves vLLM on a Unix socket behind this launcher's proxy; "
-            "the restore stays direct TCP either way")
+            "the restore uses one too, unconditionally")
     rc = cmd_start(start_namespace(args, extra, args.deadline, uds=args.uds,
                                    model=args.model))
     if rc != RC_OK:
@@ -3244,9 +3249,17 @@ def case_vision_captures_then_restores(tmp: Path) -> None:
         # operator's chat back where nothing points at it.
         check(f"--port {attempt_port}" in invocations[0],
               f"the attempt did not use the test port: {invocations[0]}")
-        check(f"--port {restore_port}" in invocations[1],
+        # The restore's engine argv no longer carries --port at all now that
+        # the restore hardcodes --uds (2026-09-04): `vllm_args()` drops
+        # --host/--port in favor of --uds, and the TCP port belongs to the
+        # proxy instead. state.json's `port` field is what the supervisor
+        # actually claimed to serve on, transport-independent — check that
+        # rather than the engine's own argv.
+        state = json.loads(
+            (home / ".local" / "state" / "dsh-serve" / "state.json").read_text())
+        check(str(state.get("port")) == str(restore_port),
               f"the restore did not land on the shipped port {restore_port} — it "
-              f"would strand the chat: {invocations[1]}")
+              f"would strand the chat: {state}")
         # An experiment flag belongs to the attempt alone. A restore carrying it
         # would quietly ship whatever was being tested.
         check("--mm-processor-cache-gb 0" in invocations[0],
@@ -3498,11 +3511,13 @@ def case_proxy_never_outlives_server(tmp: Path) -> None:
             supervisor.wait()
 
 
-def case_uds_restore_is_direct_tcp(tmp: Path) -> None:
-    """⛔ `--uds` on the attempt must never reach the restore.
+def case_restore_hardcodes_uds(tmp: Path) -> None:
+    """⛔ The restore's transport is hardcoded, never inherited from the attempt.
 
-    Known good is text-only, direct TCP, no proxy. A restore into the UDS path
-    would be a restore into the unproven thing the attempt was testing.
+    Flipped 2026-09-04: known good is now `--uds` (13/13 reachable across this
+    box's history, against direct TCP's 4/6 on classified restores). Running
+    the attempt on direct TCP — the opposite of the restore's hardcoded value —
+    proves the restore is not simply copying whatever the attempt used.
     """
     env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
     served = tmp / "serve-argv.log"
@@ -3516,21 +3531,22 @@ def case_uds_restore_is_direct_tcp(tmp: Path) -> None:
     port = free_port()
 
     try:
-        run_self(env, "try-vision", "--vllm-bin", str(mute), "--uds",
+        run_self(env, "try-vision", "--vllm-bin", str(mute),
                  "--port", port, "--restore-port", port,
                  "--deadline", "12", "--restore-timeout", "12", timeout=420)
 
         invocations = served.read_text().splitlines() if served.exists() else []
         check(len(invocations) == 2,
               f"expected an attempt then a restore, got {invocations}")
-        check("--uds" in invocations[0],
-              f"the attempt did not serve on a Unix socket: {invocations[0]}")
-        check("--host" not in invocations[0],
-              f"the attempt kept a TCP bind alongside the socket: {invocations[0]}")
-        check("--uds" not in invocations[1],
-              f"the restore inherited the unproven UDS path: {invocations[1]}")
-        check(f"--host {HOST}" in invocations[1] and "--port" in invocations[1],
-              f"the restore is not direct TCP: {invocations[1]}")
+        check("--uds" not in invocations[0],
+              f"the attempt was not direct TCP as configured: {invocations[0]}")
+        check(f"--host {HOST}" in invocations[0] and "--port" in invocations[0],
+              f"the attempt is not direct TCP: {invocations[0]}")
+        check("--uds" in invocations[1],
+              f"the restore did not use --uds — it is hardcoded on regardless "
+              f"of the attempt's transport: {invocations[1]}")
+        check("--host" not in invocations[1],
+              f"the restore kept a TCP bind alongside --uds: {invocations[1]}")
     finally:
         path = home / ".local" / "state" / "dsh-serve" / "state.json"
         stale = json.loads(path.read_text()) if path.exists() else {}
@@ -3548,7 +3564,7 @@ def case_uds_restore_is_direct_tcp(tmp: Path) -> None:
 
 CASES = {
     "argv": case_argv,
-    "uds-restore": case_uds_restore_is_direct_tcp,
+    "uds-restore": case_restore_hardcodes_uds,
     "proxy-stream": case_proxy_streams,
     "proxy-death": case_proxy_death_refuses,
     "proxy-lifecycle": case_proxy_never_outlives_server,
