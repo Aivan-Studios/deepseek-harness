@@ -1,0 +1,3759 @@
+#!/usr/bin/env python3
+"""dsh-serve — start and stop the DSH GPU tenant under ARM arbitration.
+
+The GPU tenant of the local agent stack is the vLLM server holding
+Qwen3.8-27B-NVFP4 (~25 GB, weight load until process exit), not the
+`deepseek-harness` repo, which is an HTTP client of it and touches no GPU. That
+repo is an upstream-clean clone and carries no ARM code, so the integration
+lives here: one launcher, outside any git tree, in the shape of `~/bin/arm` and
+`~/bin/aivan-indexer`.
+
+Mode is WRAPPED (ARM consumer brief §4a): ARM holds the lease for the child's
+lifetime. App `dsh`, pool `gpu0`, always `--exclusive`, registered default
+priority `fleet` — fleet substrate serving a dev harness, which must queue
+behind `inference` and `vl-server` because production depends on those.
+
+⛔ The lease must never outlive the residency.
+
+`arm run` blocks on `child.wait()` and releases the lease in the `finally` that
+follows, so it releases when its DIRECT child exits. vLLM forks
+`VLLM::EngineCore`, which holds all 25 GB and survives a signal sent to its
+parent's PID alone — so a teardown that kills only the parent reports the card
+FREE while it is full, and on WSL2 the next tenant does not fail clean: it
+spills to host shared memory and collapses throughput 10-40x while reporting
+success.
+
+Two measurements bound this, and they say different things:
+
+  * A GPU-free stand-in (`selftest --case pgroup`) shows the shape is possible:
+    the wrapper's `wait()` returns over a live grandchild, a PID-only signal
+    leaks it, and only the recorded process group reaps both.
+  * On the real server (2026-08-24, operator-authorised): `kill -TERM` to the
+    process group reaped `VLLM::EngineCore`, and the VRAM came back at t+2s —
+    six seconds BEFORE the parent exited. So on that shutdown a group signal
+    ordered itself favourably and `arm run`'s release would have been correct.
+
+The group kill below is built on the second. The VRAM gate is built on the fact
+that the second measures ONE shutdown: the gate exists for the day the ordering
+is different, which is exactly the day nothing else would notice.
+
+So `arm run`'s direct child is not vLLM. It is this script's `_supervise` verb,
+which:
+
+  * puts vLLM in its own process group and records the group id,
+  * on teardown kills THAT recorded group — never a pattern, never `pkill`,
+  * kills before reaping, so the group id cannot be recycled out from under it
+    (the leader stays an unreaped zombie, pinning its PID),
+  * and does not exit until `nvidia-smi` shows the VRAM back at its
+    pre-launch baseline.
+
+Because the supervisor's exit is what releases the lease, that last step is the
+whole guarantee. If the VRAM does not come back, the supervisor deliberately
+stays resident holding the lease and says so, every 30 s, forever: an
+over-held lease costs a queue, an under-held one corrupts the box.
+
+`try-vision` is the guarded start (TD ruling, 2026-08-25). The vision tower
+fits with the 128k window fully intact — measured, twice — but no image was ever
+served end to end, because both vision boots came up unreachable. So the verb
+that turns the eyes on is also the verb that proves them: it starts with the
+tower, sends one image, checks the model names the colour, and on any failure
+captures evidence and puts the known-good text-only server back. The operator's
+chat is working when it returns, or the exit code says a human is needed.
+
+`--uds` (on `start` and `try-vision`) serves vLLM on a Unix socket behind a TCP
+proxy this launcher owns and supervises, so the consumers' port is held by a
+socket that binds and listens together. It exists because every start here whose
+bind->listen gap exceeded ~100 s came up with a live listener that never received
+a SYN. Consumers cannot tell: `http://127.0.0.1:8001` is byte-unchanged. Off by
+default — direct TCP text-only is the proven configuration, and it is what every
+restore returns to.
+
+Verbs:  start · try-vision · stop · status · selftest
+        (`_supervise` and `_proxy` are internal)
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import fcntl
+import http.client
+import json
+import os
+import pwd
+import re
+import struct
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import zlib
+from pathlib import Path
+
+APP = "dsh"
+POOL = "gpu0"
+REGISTERED_PRIO = "fleet"
+
+SERVED_MODEL_NAME = "Qwen3.8-27B"
+HOST = "127.0.0.1"
+PORT = 8001
+DEFAULT_VLLM_BIN = Path.home() / ".venvs" / "vllm" / "bin" / "vllm"
+
+# The model register — path/window/pool per checkpoint, plus DEFAULT_PROFILE
+# and KNOWN_GOOD_PROFILE — lives in deepseek-harness on its own branch, never
+# on master (this launcher is local-fleet content with no upstream
+# equivalent, and a commit on master would break the fast-forward a `git
+# pull` from upstream depends on). Read via `git show`, never a working-tree
+# path, so it resolves regardless of what branch `~/dev/deepseek-harness`
+# happens to have checked out — see tools/dsh-serve/models.py on that branch
+# for the full rationale and the two current profiles.
+#
+# Real passwd home, not `Path.home()`: `Path.home()` reads $HOME, which
+# `selftest`'s sandboxed children deliberately override to isolate STATE
+# (locks, logs, the models/ dir a profile's own path resolves under). The
+# register's location is a fixed fact about this box's deployment, not state
+# — a sandboxed child must still find the real register, exactly like it
+# still finds this script itself via `__file__` rather than a relocated copy.
+REGISTER_REPO = Path(pwd.getpwuid(os.getuid()).pw_dir) / "dev" / "deepseek-harness"
+REGISTER_BRANCH = "local/dsh-serve-models"
+REGISTER_PATH_IN_REPO = "tools/dsh-serve/models.py"
+
+# Added to the server's environment.
+#
+# `~/.venvs/vllm` carries flashinfer-python 0.6.16.post3 against
+# flashinfer-cubin 0.6.12, and FlashInfer refuses to import a mismatched pair.
+# vLLM imports it from several unrelated places (the top-k/top-p sampler probe,
+# `flashinfer.comm`), so any one of them aborts engine startup.
+#
+# The pair CANNOT be aligned: vLLM 0.27.1 pins flashinfer-python==0.6.16.post3,
+# and flashinfer-cubin does not publish past 0.6.13 — there is no matching
+# cubin release to install. The cubin package lags the Python one, so this
+# bypass is the only available answer and is the one FlashInfer's own error
+# names.
+#
+# What the check is protecting is cubin loading, which this box never reaches:
+# the attention backend is TRITON_ATTN and `flashinfer.comm` is multi-GPU. If a
+# cubin ever were loaded, it would fail at that point rather than silently —
+# the bypass defers the check, it does not suppress a failure.
+#
+# The second setting is required BECAUSE of the first, and the pair was
+# established by testing them separately — each alone still fails:
+#
+#   * version check alone: the import now succeeds, so vLLM concludes the
+#     FlashInfer sampler IS available, selects `forward_cuda`, and dies in
+#     `_dummy_sampler_run` trying to JIT-compile the sampling kernel
+#     (flashinfer/jit/core.py `check_cuda_arch`, which reports "requires sm75
+#     or higher" — a compile failure, not a capability one; this card is
+#     sm_120). The JIT toolchain is broken here: FlashInfer itself warns that
+#     nvidia-cuda-nvcc/nvvm 13.3.73 disagree with nvidia-cuda-tileiras 13.2.86.
+#   * sampler off alone: the version check still aborts the unrelated
+#     `import flashinfer.comm` during engine init.
+#
+# Together: FlashInfer imports, and nothing asks it to compile anything.
+SERVER_ENV = {
+    "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+    "VLLM_USE_FLASHINFER_SAMPLER": "0",
+}
+
+
+# The window and the KV pool are one decision per profile, not two knobs, and
+# `check_kv_pool_fits_window` is what keeps them one: `--kv-cache-memory-bytes`
+# makes vLLM skip the memory MEASUREMENT, so the pool does NOT grow to meet
+# the window. A profile's `max_model_len`/`kv_cache_memory_bytes` pair and the
+# margin arithmetic behind it live in the register (models.py on
+# REGISTER_BRANCH), beside the checkpoint they describe — not duplicated here.
+
+# The floor for one max-length request, per token, from the checkpoint's own
+# geometry. `1` is the byte width of an fp8 KV entry and deliberately the
+# smallest any KV dtype uses: a pool under this floor cannot serve the window
+# under ANY configuration, so the guard never refuses a valid one. Every
+# profile currently shares `--kv-cache-dtype auto` (unset, vLLM's own
+# default); this floor assumes best-case FP8 regardless, so it cannot see a
+# profile serving BF16 KV underneath that default — the abliterated profile's
+# 2026-08-30 OOM surfaced from vLLM five minutes into a cold start rather than
+# from this preflight, and a per-profile KV-dtype-aware floor is open, tracked
+# separately from this build (TD, 2026-08-31).
+KV_DTYPE_BYTES_FLOOR = 1
+
+_REGISTER_CACHE: dict | None = None
+
+
+def load_register() -> dict:
+    """The model register's namespace (PROFILES, DEFAULT_PROFILE,
+    KNOWN_GOOD_PROFILE), read fresh via `git show` on first use per process and
+    cached after.
+
+    ⛔ Never a working-tree read: `~/dev/deepseek-harness` can be checked out
+    to anything, and the register must resolve the same way regardless. A
+    missing branch, an unreadable repo, or a syntax error in the register is a
+    refusal — this launcher cannot choose a model without it, and guessing a
+    profile would be worse than refusing.
+    """
+    global _REGISTER_CACHE
+    if _REGISTER_CACHE is not None:
+        return _REGISTER_CACHE
+    ref = f"{REGISTER_BRANCH}:{REGISTER_PATH_IN_REPO}"
+    proc = subprocess.run(["git", "-C", str(REGISTER_REPO), "show", ref],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"cannot read the model register ({ref}) from {REGISTER_REPO}: "
+            f"{proc.stderr.strip()}. Without it this launcher cannot choose "
+            "a model — nothing was started.", RC_FAIL)
+    namespace: dict = {}
+    try:
+        exec(compile(proc.stdout, ref, "exec"), namespace)
+    except Exception as exc:
+        die(f"the model register at {ref} failed to load: {exc}. Nothing "
+            "was started.", RC_FAIL)
+    for required in ("PROFILES", "DEFAULT_PROFILE", "KNOWN_GOOD_PROFILE"):
+        if required not in namespace:
+            die(f"the model register at {ref} has no {required} — it is "
+                "not a valid register. Nothing was started.", RC_FAIL)
+    _REGISTER_CACHE = namespace
+    return namespace
+
+
+def resolve_profile(name: str | None) -> tuple[str, dict]:
+    """The (name, profile) pair to launch: `name`, or the register's
+    `DEFAULT_PROFILE` when omitted — never a caller-side default, so AS3's
+    argument-free launch line keeps deferring to whatever this box's operator
+    last set as default.
+
+    Refuses loudly, before anything touches ARM or the GPU, on a name the
+    register does not have — never a silent fallback to known-good, which
+    would run a caller against weights it did not choose.
+    """
+    register = load_register()
+    resolved = name or register["DEFAULT_PROFILE"]
+    profiles = register["PROFILES"]
+    if resolved not in profiles:
+        die(f"unknown model profile {resolved!r}. Known profiles: "
+            f"{', '.join(sorted(profiles))}. Nothing was started.", RC_FAIL)
+    return resolved, profiles[resolved]
+
+
+def vllm_args(profile: dict, port: int, uds: str | None = None) -> list[str]:
+    """The verified serving command for `profile` (a register entry: `path`,
+    `max_model_len`, `kv_cache_memory_bytes`). The non-obvious flags are
+    documented in the `qwen38-27b-nvfp4-single-5090` memory; do not drift them
+    casually.
+
+    With `uds`, vLLM serves on a Unix socket and `--host`/`--port` are ignored by
+    it entirely; the TCP port then belongs to this launcher's proxy instead.
+    """
+    address = ["--uds", uds] if uds else ["--host", HOST, "--port", str(port)]
+    return [
+        "serve", str(profile["path"]),
+        *address,
+        "--served-model-name", SERVED_MODEL_NAME,
+        "--max-model-len", str(profile["max_model_len"]),
+        "--language-model-only",
+        "--kv-cache-memory-bytes", str(profile["kv_cache_memory_bytes"]),
+        "--max-num-seqs", "16",
+        "--linear-backend", "cutlass",
+        "--attention-backend", "TRITON_ATTN",
+        "--reasoning-parser", "qwen3",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", "qwen3_xml",
+    ]
+
+
+# What `try-vision` appends to turn the eyes on. Deliberately ONE flag: this is
+# exactly the configuration measured on 2026-08-25, twice, and nothing else.
+#
+# `--language-model-only` zeroes every modality limit, which is what makes an
+# image request fail with `At most 0 image(s) may be provided in one prompt`.
+# Negating it is sufficient — image limits then default to 999/modality, so
+# `--limit-mm-per-prompt` is NOT needed to accept images, only to bound them.
+#
+# Measured cost: 910-1,238 MiB at rest (879 MiB of BF16 tower weights + 160 MiB
+# of encoder cache at 16,384 tokens x 5,120 x 2 B), boot peak 30,097 MiB of a
+# 32,607 MiB card. The KV pool does NOT move: both boots logged the same
+# `156,683 tokens` / `1.20x` as text-only, because the only multimodal path that
+# shrinks the pool subtracts `mm_ipc_gpu_memory_gb`, which defaults to 0. So the
+# window and the eyes are not in competition and there is no trade to make.
+#
+# Two knobs deliberately NOT set here, both unmeasured on this box:
+#   * `--limit-mm-per-prompt '{"video":0}'` would drop the unwanted video path.
+#     It does not shrink the encoder budget — that is driven by the image's
+#     16,384 tokens/item, which already exceeds video's 12,288.
+#   * `--mm-processor-kwargs '{"size":{"longest_edge":N,...}}'` caps resolution,
+#     and is the margin lever if one is ever needed: image tokens = pixels/1024
+#     (patch 16^2 x merge 2^2), so 2,097,152 px gives 2,048 tokens/item and cuts
+#     the encoder cache to its 2,048-token floor.
+VISION_ARGS = ["--no-language-model-only"]
+
+# A flag flip in EITHER direction pays a full cold recompile, because
+# `language_model_only` is part of vLLM's compile-cache hash. Measured
+# 2026-08-25: 411 s from launch to `Application startup complete`. The deadline
+# is set well above that because a premature restore costs another whole
+# recompile, which is more downtime than waiting would have been.
+VISION_READY_TIMEOUT_S = 900.0
+
+# `nvidia-smi` is device-wide and includes the Windows host (~0.8 GB with no
+# monitor attached), which drifts under us. The baseline absorbs the constant
+# part; this absorbs the drift. Below it, our 25 GB is unambiguously gone.
+VRAM_RETURNED_TOLERANCE_MIB = 500
+
+# `nvidia-smi` stalls on this box. Teardown may wait — the reading IS the safety
+# guarantee there. A read-only verb may not: a machine consumer needs a typed
+# answer in seconds, and `null` for "could not read" is a real answer.
+SMI_TIMEOUT_S = 20.0
+SMI_QUICK_TIMEOUT_S = 3.0
+
+TERM_GRACE_S = 30.0        # vLLM's own unwind before SIGKILL
+VRAM_RETURN_TIMEOUT_S = 120.0
+STOP_WAIT_S = 300.0        # covers TERM_GRACE_S + VRAM_RETURN_TIMEOUT_S with room
+DEFAULT_READY_TIMEOUT_S = 600.0    # ~4 min cold, ~1 min with warm compile caches
+STUCK_REPORT_INTERVAL_S = 30.0
+
+# Evidence, not a mechanism (see vllm-loopback-unreachable-after-config-change):
+# a 2026-09-04 census of every launch in server.log found 20 direct-TCP starts
+# split with ZERO overlap by this one number — 6/6 reachable under 68s, 0/14
+# reachable at 77s or later. This constant sits inside that untested 68-77s
+# gap rather than at either measured edge, trading a little earliness for
+# never having fired on a start that later proved fine. `--uds` launches
+# never reach this check: 13/13 reachable in the same census, up to 395s, so
+# they do not need it, and warning on the arm that never fails would teach a
+# human to ignore the warning that does matter. 20 samples on one box is a
+# good predictor, not a law — revisit if a future direct-TCP start lands in
+# the gap and turns out reachable.
+DIRECT_TCP_UNREACHABLE_WARN_S = 75.0
+
+# Mid-session capture (TD-approved 2026-09-04, tier 1 of the forensic-gap
+# pricing): `capture_unreachable_evidence` otherwise only fires from
+# `await_ready`'s STARTUP timeout — nothing catches a server that answered
+# fine at boot and went silent later. 30s: frequent enough to notice within
+# about a minute, cheap enough (one GET every 30s) not to be the load on the
+# server it is watching. 2 consecutive misses, not 1: a single miss can be
+# one dropped packet; two 30s apart means the problem held for at least 30s
+# without recovering on its own, which is a real signal and not noise. Both
+# numbers are engineering choices, not measured constants like
+# DIRECT_TCP_UNREACHABLE_WARN_S above — there is no census behind them yet.
+MID_SESSION_PROBE_INTERVAL_S = 30.0
+MID_SESSION_MISS_THRESHOLD = 2
+
+# `arm run` pre-exec refusals (ARM README): the child never ran.
+ARM_RC_DENIED, ARM_RC_WOULD_BLOCK, ARM_RC_ERROR = 97, 98, 99
+
+# This script's own codes. 2/3/4 deliberately mirror `arm`'s direct verbs so an
+# operator reads one band, not two.
+RC_OK, RC_FAIL, RC_DENIED, RC_WOULD_BLOCK, RC_ARM_ERROR, RC_VRAM_HELD = 0, 1, 2, 3, 4, 5
+# `try-vision` only: the attempt failed AND the known-good server did not come
+# back. Distinct from RC_FAIL because it is the one outcome where the operator's
+# chat is down and nothing automatic is left to try.
+RC_RESTORE_FAILED = 6
+# Added 2026-08-27 for machine callers (Studio-3), which classify on the code and
+# never on the text. Additive: every code above keeps its meaning.
+RC_ALREADY_RUNNING = 7     # a server this launcher started is already up
+RC_CONFIG_MISMATCH = 8     # ...but not the configuration that was asked for
+RC_READY_TIMEOUT = 9       # /health never answered; the server is STILL UP
+
+# `--json`'s payload version. Bumped when a field's meaning changes or one is
+# removed; adding a field is not a bump.
+JSON_SCHEMA_VERSION = 1
+
+JSON_HELP = ("one JSON object on stdout describing the outcome, prose "
+             "unchanged on stderr. This is the machine-readable surface: "
+             "callers classify on `rc` and read fields, never the prose")
+
+
+CONSUMER_DOC = Path(os.path.expanduser(
+    "~/docs/dsh-serve-consumed-surface.md"))
+
+
+def books_path() -> Path:
+    """ARM's state root. Its presence — not the `arm` binary's — is what says
+    this box is arbitrated (consumer brief §4c)."""
+    return Path(os.path.expanduser("~/.aivan_arm/config.json"))
+
+
+def state_dir() -> Path:
+    return Path(os.path.expanduser("~/.local/state/dsh-serve"))
+
+
+def state_path() -> Path:
+    return state_dir() / "state.json"
+
+
+def log_path() -> Path:
+    return state_dir() / "server.log"
+
+
+def lock_path() -> Path:
+    return state_dir() / "start.lock"
+
+
+_LAST_SAY = ""
+_VERB_BEGAN = time.monotonic()
+
+
+def say(message: str) -> None:
+    """Prose for a human, on stderr. Never a contract: `--json` on stdout is the
+    machine-readable surface, and this text is free to be reworded."""
+    global _LAST_SAY
+    _LAST_SAY = message
+    print(f"dsh-serve: {message}", file=sys.stderr, flush=True)
+
+
+def die(message: str, rc: int) -> None:
+    say(message)
+    sys.exit(rc)
+
+
+def find_nvidia_smi() -> str | None:
+    """PATH first, then WSL's own directory, which `sshd` and non-interactive
+    shells do not inject. Returns None for "cannot read", never for "idle"."""
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    wsl = "/usr/lib/wsl/lib/nvidia-smi"
+    return wsl if os.access(wsl, os.X_OK) else None
+
+
+def read_gpu_used_mib(timeout_s: float = SMI_TIMEOUT_S) -> int | None:
+    """Device-wide VRAM in use, or None if it cannot be read.
+
+    None is UNKNOWN. No caller may read it as zero: per-process attribution is
+    blind under WSL2, so this figure is the only GPU truth available here.
+
+    The default timeout is the one the teardown paths need: there, waiting out a
+    slow `nvidia-smi` is correct, because the answer is the safety guarantee and
+    a lease is being held on it either way. Read-only verbs must NOT wait that
+    long — they use `read_gpu_used_mib_quick`.
+    """
+    smi = find_nvidia_smi()
+    if smi is None:
+        return None
+    try:
+        out = subprocess.run(
+            [smi, "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    first = out.stdout.strip().splitlines()
+    try:
+        return int(first[0].strip())
+    except (IndexError, ValueError):
+        return None
+
+
+_UNREAD = object()
+_QUICK_SMI: int | None | object = _UNREAD
+
+
+def read_gpu_used_mib_quick() -> int | None:
+    """The reading for `status` and `--json`: bounded short, and taken ONCE.
+
+    `nvidia-smi` stalls on this box — a `status` printed `unreadable` under load
+    on 2026-08-27, and `status --json` read the card twice, so a stalled binary
+    could wedge a read-only verb for 40 s before it said anything. A consumer in
+    an unexpected environment then has nothing to classify, which is the failure
+    §4c of the consumed-surface doc exists to forbid: an answer this launcher
+    cannot get is a fast, typed `null`, never a wedge.
+
+    Memoised for the process, which is exactly one verb: the two call sites also
+    stop disagreeing by a few MiB inside one payload.
+    """
+    global _QUICK_SMI
+    if _QUICK_SMI is _UNREAD:
+        _QUICK_SMI = bounded_gpu_read(SMI_QUICK_TIMEOUT_S)
+    return _QUICK_SMI
+
+
+def bounded_gpu_read(deadline_s: float) -> int | None:
+    """`read_gpu_used_mib` with a deadline that actually holds.
+
+    ⛔ `subprocess.run(timeout=N)` does NOT bound the call. Its timeout bounds
+    the WAIT; on expiry CPython does `process.kill()` and then an unbounded
+    `process.wait()`, so a child sitting in an uninterruptible kernel call has a
+    SIGKILL merely pending and the "timeout" runs as long as the driver takes.
+    Measured on this box 2026-08-27: a 3-second cap returned None after 11.5 s,
+    and a `status --json` built on it took 31.6 s.
+
+    A daemon thread makes the join the real bound. The stuck child stays stuck —
+    nothing in userspace can fix that — but the verb answers on time and the
+    thread dies with the interpreter.
+    """
+    answer: list[int | None] = []
+    worker = threading.Thread(
+        target=lambda: answer.append(read_gpu_used_mib(deadline_s)),
+        daemon=True)
+    worker.start()
+    worker.join(deadline_s)
+    return answer[0] if answer else None
+
+
+def attention_kv_bytes_per_token(model_path: Path) -> int | None:
+    """A lower bound on KV bytes per token, from `model_path`'s own config, or
+    None when it cannot be derived.
+
+    ⛔ Takes `model_path` as a value, never a global: this is the profile
+    whose window/pool pair is being checked, and reading a module-level
+    constant instead would let a partial parameterization check the WRONG
+    checkpoint's geometry against a different profile's pool — silently,
+    since both are plausible numbers (TD, 2026-08-31).
+
+    Counts attention KV only — full-attention layers x KV heads x head_dim x
+    (K + V) x the narrowest KV dtype. The engine needs strictly more than this
+    (linear-attention state is carved from the same pool), which is what makes
+    it safe to refuse on: every term is a real requirement, so nothing this
+    rejects could have served the window.
+    """
+    try:
+        with open(model_path / "config.json") as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    # Multimodal checkpoints nest the language model's geometry; this one is
+    # served `--language-model-only`, and its own config is flat.
+    text = config.get("text_config") or config
+    types = text.get("layer_types")
+    if isinstance(types, list) and types:
+        full = sum(1 for one in types if one == "full_attention")
+    else:
+        layers, interval = text.get("num_hidden_layers"), text.get("full_attention_interval")
+        if not isinstance(layers, int) or not isinstance(interval, int) or interval < 1:
+            return None
+        full = layers // interval
+    heads, head_dim = text.get("num_key_value_heads"), text.get("head_dim")
+    if not all(isinstance(one, int) and one > 0 for one in (full, heads, head_dim)):
+        return None
+    return full * heads * head_dim * 2 * KV_DTYPE_BYTES_FLOOR
+
+
+def last_flag_value(argv: list[str], flag: str) -> str | None:
+    """The winning value for `flag`, matching how the parser downstream reads a
+    repeated flag: operator overrides are appended after the defaults."""
+    value = None
+    for index, one in enumerate(argv):
+        if one == flag and index + 1 < len(argv):
+            value = argv[index + 1]
+        elif one.startswith(f"{flag}="):
+            value = one.split("=", 1)[1]
+    return value
+
+
+def check_kv_pool_fits_window(serve_args: list[str]) -> str | None:
+    """Why the pinned KV pool cannot hold one max-length request, or None.
+
+    Pinning `--kv-cache-memory-bytes` makes vLLM skip memory profiling, so the
+    pool never grows to meet `--max-model-len`. Raising the window alone is
+    therefore not a tight fit but a `ValueError` out of engine init — roughly a
+    minute in, weights already loaded, GPU already claimed. This asks the same
+    question as a division, before the claim.
+
+    Checked against the composed command rather than a profile value, so an
+    operator's trailing override is covered too — which is when the two are
+    most likely to drift apart. The model path is read the same way, from
+    `serve_args[1]` (`vllm_args` always emits `["serve", path, ...]`), so this
+    checks the SAME checkpoint whose window/pool it is checking — never a
+    stale global left over from a previous profile.
+    """
+    window = last_flag_value(serve_args, "--max-model-len")
+    pool = last_flag_value(serve_args, "--kv-cache-memory-bytes")
+    if window is None or pool is None:
+        return None            # unpinned: vLLM profiles and sizes it itself
+    try:
+        window_tokens, pool_bytes = int(window), int(pool)
+    except ValueError:
+        return None            # vLLM owns rejecting malformed values
+    if window_tokens < 0:
+        return None            # -1 is auto-fit; vLLM picks the window
+    model_path = Path(serve_args[1]) if len(serve_args) > 1 and serve_args[0] == "serve" else None
+    per_token = attention_kv_bytes_per_token(model_path) if model_path else None
+    if per_token is None:
+        say(f"WARNING: cannot read the KV geometry from {model_path}/config.json, "
+            "so the pool/window check is unavailable; vLLM remains the authority")
+        return None
+    needed = window_tokens * per_token
+    if needed <= pool_bytes:
+        return None
+    return (
+        f"--kv-cache-memory-bytes {pool_bytes} ({pool_bytes / 2**30:.2f} GiB) cannot "
+        f"hold one {window_tokens}-token request: attention KV alone needs "
+        f"{needed} bytes ({needed / 2**30:.2f} GiB) at {per_token} bytes/token, and "
+        f"linear-attention state comes out of the same pool on top of that. "
+        f"`--kv-cache-memory-bytes` skips vLLM's memory profiling, so the pool does "
+        f"not grow to meet the window — raise it above {needed}, or lower "
+        f"--max-model-len. Refusing before claiming {POOL}; vLLM would raise this "
+        "about a minute into startup with the card already taken.")
+
+
+def settings_path() -> Path:
+    return Path.home() / ".dsh" / "settings.yaml"
+
+
+def check_settings_context_window(max_model_len: int) -> str | None:
+    """Why `~/.dsh/settings.yaml`'s `contextWindow` disagrees with the
+    profile about to be served, or None.
+
+    The harness sizes compaction from `contextWindow` (dsh-local-llm-wiring
+    memory); a smaller server window than the harness believes it has turns a
+    chat overflow into a hard mid-turn failure instead of a proactive
+    compaction. Nothing else validates this pairing — a per-profile window
+    makes it a per-profile invariant, checked here, before claiming the GPU,
+    same failure class as `check_kv_pool_fits_window`.
+
+    Degrades to a WARNING, never a refusal, when settings.yaml or its
+    `contextWindow` cannot be read: an unreadable INPUT to a check is not
+    evidence of a mismatch, and a first-ever boot on a fresh box has no
+    settings.yaml yet.
+    """
+    path = settings_path()
+    try:
+        text = path.read_text()
+    except OSError:
+        say(f"WARNING: cannot read {path}, so the contextWindow / "
+            "--max-model-len pairing is unchecked")
+        return None
+    match = re.search(
+        r"-\s+id:\s*" + re.escape(SERVED_MODEL_NAME) + r"\b.*?contextWindow:\s*(\d+)",
+        text, re.DOTALL)
+    if match is None:
+        say(f"WARNING: no contextWindow found for model id {SERVED_MODEL_NAME!r} "
+            f"in {path}, so the pairing is unchecked")
+        return None
+    declared = int(match.group(1))
+    if declared == max_model_len:
+        return None
+    return (
+        f"{path} declares contextWindow {declared} for {SERVED_MODEL_NAME!r}, "
+        f"but this launch uses --max-model-len {max_model_len}. The harness "
+        f"sizes compaction from contextWindow, so a mismatch turns a chat "
+        f"overflow into a hard mid-turn failure instead of a proactive "
+        f"compaction. Edit {path}'s contextWindow to {max_model_len} and "
+        f"retry. Refusing before claiming {POOL}.")
+
+
+def pgid_members(pgid: int) -> list[int]:
+    """Every live process in `pgid`, read from /proc.
+
+    Identity comes from the recorded group id alone. Nothing here matches on a
+    name or a command line, so this can never reach a process we did not start.
+    """
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as handle:
+                fields = handle.read().rsplit(b")", 1)[1].split()
+        except OSError:
+            continue  # exited between listdir and open
+        if len(fields) > 2 and int(fields[2]) == pgid and fields[0] != b"Z":
+            found.append(int(entry))
+    return found
+
+
+def proc_stat(pid: int) -> list[bytes] | None:
+    """`/proc/<pid>/stat` from the field after `comm`, or None if it is gone.
+
+    Split on the LAST `)` because `comm` is unquoted and may contain one.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            return handle.read().rsplit(b")", 1)[1].split()
+    except OSError:
+        return None
+
+
+def pid_start_ticks(pid: int) -> int | None:
+    """The PID's start time, which makes a recorded PID unambiguous.
+
+    PIDs are recycled. Recording this alongside one turns "is my process still
+    there" into a question that cannot accidentally answer yes about a stranger
+    — the discipline ARM applies to its own leases.
+    """
+    fields = proc_stat(pid)
+    return int(fields[19]) if fields and len(fields) > 19 else None
+
+
+def pid_elapsed_seconds(pid: int | None) -> float | None:
+    """How long the PID has been alive, measured on the boot clock.
+
+    Reported next to the wall-clock `started_at` because the two disagree on
+    this box and a reader reconciling a timeline cannot tell which one moved.
+    WSL2 syncs its clock to the Windows host (`hv_utils.timesync_implicit=1`
+    on the kernel command line); a forward step leaves every record written
+    before it — log lines, file mtimes, `started_at` — where it was, and moves
+    the start time `ps lstart` and `etimes` derive for every process that was
+    already running. Measured 2026-08-25: a server whose own first log line
+    reads 15:42:07 had `ps lstart` reporting 15:44:32.
+    """
+    ticks = pid_start_ticks(pid) if pid else None
+    if ticks is None:
+        return None
+    try:
+        with open("/proc/uptime") as handle:
+            uptime = float(handle.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return uptime - ticks / os.sysconf("SC_CLK_TCK")
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "unknown"
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+def pid_alive(pid: int | None, start_ticks: int | None = None) -> bool:
+    """Live, and — when `start_ticks` is recorded — still the same process.
+
+    A zombie is NOT alive: it has exited and released everything it held, and
+    only its exit status is still on the books. Answering yes for one would
+    make `stop` wait out its full timeout against a process that is already
+    done, and report the card held when it is free.
+    """
+    if pid is None or pid < 1:
+        return False
+    fields = proc_stat(pid)
+    if fields is None or fields[0] == b"Z":
+        return False
+    if start_ticks is None:
+        return True
+    return pid_start_ticks(pid) == start_ticks
+
+
+def write_state(payload: dict) -> None:
+    """Atomic, so a reader never sees a half-written record."""
+    state_dir().mkdir(parents=True, exist_ok=True)
+    handle, tmp = tempfile.mkstemp(dir=state_dir(), prefix=".state-")
+    with os.fdopen(handle, "w") as out:
+        json.dump(payload, out, indent=2)
+        out.write("\n")
+    os.replace(tmp, state_path())
+
+
+def read_state() -> dict | None:
+    try:
+        with open(state_path()) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+_START_LOCK = None
+
+
+def take_start_lock():
+    """An exclusive, non-blocking lock held for the whole `start` verb.
+
+    Returns the open descriptor, or None if another `start` holds it. Kept in a
+    module global as well: the lock lives as long as the descriptor, and a local
+    that fell out of scope would release it mid-start.
+    """
+    global _START_LOCK
+    if _START_LOCK is not None:
+        # `try-vision` starts twice in one process — the attempt, then the
+        # restore. flock is per open file description, so a second `open()`
+        # here would deadlock this process against itself; one invocation is
+        # one caller and already holds the lock it needs.
+        return _START_LOCK
+    state_dir().mkdir(parents=True, exist_ok=True)
+    handle = os.open(lock_path(), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(handle)
+        return None
+    os.ftruncate(handle, 0)
+    os.write(handle, f"{os.getpid()}\n".encode())
+    _START_LOCK = handle
+    return handle
+
+
+def accept_running(live: dict, serve_args: list[str]) -> int:
+    """`--if-not-running` against a server that is already up.
+
+    Success ONLY when the running configuration is the one asked for. A server
+    serving something else is a failure with a name, not a hit: silently
+    accepting it would hand the caller a model, a window or a modality it did
+    not ask for and report success.
+    """
+    if state_phase(live) != "serving":
+        die("a start is already in flight; it has not answered /health yet. "
+            "Wait for it and read `dsh-serve status`.", RC_ALREADY_RUNNING)
+    recorded = live.get("serve_args")
+    if recorded is None:
+        die("already running, but its record predates configuration recording "
+            "(pre-2026-08-27), so this cannot verify it is the configuration "
+            "you asked for. Restart it, or drop --if-not-running to accept "
+            "whatever is up.", RC_CONFIG_MISMATCH)
+    if list(recorded) != list(serve_args):
+        # Named first because it is the difference that changes what the server
+        # can DO: a text-only server answers a captioning request successfully
+        # and describes nothing.
+        eyes = vision_requested(recorded), vision_requested(serve_args)
+        if eyes[0] != eyes[1]:
+            die(f"already running, but the VISION STATE differs: running with "
+                f"the tower {'ON' if eyes[0] else 'OFF'}, requested "
+                f"{'ON' if eyes[1] else 'OFF'}. `dsh-serve try-vision` is the "
+                "verb that turns the eyes on and proves them.",
+                RC_CONFIG_MISMATCH)
+        die(f"already running, but NOT as requested. Running: {recorded}. "
+            f"Requested: {serve_args}. `dsh-serve stop` first if you need the "
+            "requested configuration.", RC_CONFIG_MISMATCH)
+    say(f"already running as requested: {SERVED_MODEL_NAME} on "
+        f"http://{HOST}:{live.get('port', PORT)}, vllm pid "
+        f"{live.get('vllm_pid')}; nothing started")
+    return RC_OK
+
+
+def state_phase(live: dict | None) -> str:
+    """`starting` from the moment `start` spawns the wrapper; `serving` once the
+    supervisor has the server.
+
+    Records written before 2026-08-27 carry no phase and are always `serving` —
+    only a supervisor wrote a record then, and only after its `Popen`. Reading a
+    missing phase as `starting` would make `stop` chase a wrapper that is not
+    coming.
+    """
+    return (live or {}).get("phase", "serving")
+
+
+def vision_requested(serve_args: list[str] | None) -> bool | None:
+    """Whether these arguments ASK for the vision tower, by the last modality
+    flag — vLLM takes the last occurrence, and `try-vision` appends its negation
+    to the shipped list rather than rewriting it.
+
+    None when the record predates configuration recording, which is not the same
+    as False. Asking is not proof: see `vision_state`.
+    """
+    if not serve_args:
+        return None
+    seen = [one for one in serve_args
+            if one in ("--language-model-only", "--no-language-model-only")]
+    return seen[-1] == "--no-language-model-only" if seen else False
+
+
+def vision_state(live: dict | None) -> bool | None:
+    """Whether this server can be sent an image. Three values, three meanings.
+
+    `True` only once a real image round-tripped through it — `try-vision`'s own
+    proof, recorded on the way past. `False` only when the launcher itself
+    passed `--language-model-only`, which zeroes every modality limit, so an
+    image comes back `At most 0 image(s) may be provided in one prompt`; that is
+    knowable without checking. `None` is unknown — the record predates this
+    field, or the arguments ask for the tower and nothing has proved it yet.
+
+    ⛔ Never `False` for "we did not look". A consumer that gates captioning on
+    this must be able to read `False` as a refusal and `None` as a question.
+    """
+    if not live:
+        return None
+    if live.get("vision_proven"):
+        return True
+    return False if vision_requested(live.get("serve_args")) is False else None
+
+
+def mark_vision_proven(port: int) -> None:
+    """Record that an image round-tripped, so a later reader does not have to
+    re-prove it. Only ever called after `image_probe` passed."""
+    live = read_state()
+    if live:
+        write_state({**live, "vision_proven": True,
+                     "vision_proven_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                     "vision_proven_port": port})
+
+
+def served_model_id(port: int) -> str | None:
+    """The id the SERVER reports, which is the only evidence of what is loaded.
+    The state file's `model` is what this launcher asked for."""
+    try:
+        with urllib.request.urlopen(
+                f"http://{HOST}:{port}/v1/models", timeout=3) as response:
+            data = json.load(response).get("data") or []
+        return data[0].get("id") if data else None
+    except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError,
+            http.client.HTTPException):
+        return None
+
+
+def json_payload(rc: int) -> dict:
+    """The machine-readable answer, identical for every verb.
+
+    `model` is queried from the server and `model_requested` comes from the
+    state file: a caller comparing its own expected id against `model` is
+    comparing against evidence. `message` is the last line of prose and is for
+    display only — parsing it is the mistake `--json` exists to remove.
+
+    `profile` (additive, 2026-08-31) is the register profile name this
+    launcher resolved and started — `model_served`/`model_requested` are both
+    always `SERVED_MODEL_NAME`, so neither can say WHICH weights answered a
+    request; `/v1/models`'s `root` field answers that too, but only once the
+    server is already up. `profile` answers it from the state file alone.
+    """
+    live = read_state() or {}
+    port = live_port(live if live else None)
+    healthy = server_ready_once(port)
+    used = read_gpu_used_mib_quick()
+    return {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "rc": rc,
+        "running": bool(live) and (
+            pid_alive(live.get("supervisor_pid"),
+                      live.get("supervisor_start_ticks"))
+            or pid_alive(live.get("wrapper_pid"),
+                         live.get("wrapper_start_ticks"))),
+        "phase": state_phase(live) if live else None,
+        "healthy": healthy,
+        "model_served": served_model_id(port) if healthy else None,
+        "model_requested": live.get("model"),
+        "profile": live.get("profile"),
+        "vision": vision_state(live),
+        "vision_requested": vision_requested(live.get("serve_args")),
+        "endpoint": f"http://{HOST}:{port}",
+        "port": port,
+        "arbitrated": live.get("arbitrated"),
+        "serving_since": live.get("started_at"),
+        "up_seconds": pid_elapsed_seconds(live.get("vllm_pid")),
+        "supervisor_pid": live.get("supervisor_pid"),
+        "vllm_pid": live.get("vllm_pid"),
+        "proxy_pid": live.get("proxy_pid"),
+        "vram_used_mib": used,
+        "vram_baseline_mib": live.get("vram_baseline_mib"),
+        # Additive, and it exists because diagnosing a slow call otherwise takes
+        # a person with a stopwatch: `nvidia-smi` on this box costs seconds on
+        # its first call after an idle period and ~0.1 s warm, so a consumer
+        # that logs this can tell "the box was cold" from "the launcher is
+        # broken" without re-running anything.
+        "elapsed_seconds": round(time.monotonic() - _VERB_BEGAN, 3),
+        "message": _LAST_SAY,
+    }
+
+
+def port_in_use(port: int) -> bool:
+    with socket.socket() as probe:
+        probe.settimeout(1.0)
+        return probe.connect_ex((HOST, port)) == 0
+
+
+_HEALTH: dict[int, bool] = {}
+
+
+def server_ready_once(port: int) -> bool:
+    """`server_ready` for the read-only verbs: asked once per process.
+
+    `status --json` probed health twice — in the prose and again in the payload
+    — for the same reason it read the card twice. One verb is one snapshot, and
+    two answers inside one output could disagree.
+    """
+    if port not in _HEALTH:
+        _HEALTH[port] = server_ready(port)
+    return _HEALTH[port]
+
+
+def server_ready(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://{HOST}:{port}/health", timeout=3) as response:
+            return response.status == 200
+    # While the proxy is up but vLLM is not, the proxy accepts and closes at
+    # once rather than hanging, which surfaces here as a protocol-level
+    # disconnect rather than a socket error.
+    except (urllib.error.URLError, OSError, ValueError,
+            http.client.HTTPException):
+        return False
+
+
+def arm_available() -> bool:
+    """Runnable, not merely present on PATH."""
+    found = shutil.which("arm")
+    if found is None:
+        return False
+    try:
+        return subprocess.run([found, "--help"], capture_output=True,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def describe_blockers() -> str:
+    """Name who is in the way, from `blockers_detail` values — never by parsing
+    `reason`, whose wording is not a contract (consumer brief §3)."""
+    try:
+        out = subprocess.run(["arm", "check", POOL, "--exclusive", "--json"],
+                             capture_output=True, text=True, timeout=30)
+        payload = json.loads(out.stdout)
+        # Both `check` and `claim` nest the decision under `decision`, at the
+        # same depth and with the same keys (verified 2026-08-24); `claim` adds
+        # a top-level `lease`, which is the only structural difference. A
+        # top-level read of `blockers_detail` finds nothing from either.
+        detail = (payload.get("decision") or {}).get("blockers_detail") or []
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return ""
+    parts = []
+    for one in detail:
+        who = one.get("app", "?")
+        why = one.get("purpose") or "no purpose recorded"
+        # `waiter` means the pool may be entirely free and we are standing aside
+        # for a queued higher-priority claim; "held by" would be a lie.
+        verb = "held by" if one.get("kind") == "lease" else "queued behind"
+        parts.append(f"{verb} {who} ({why})")
+    return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# evidence trap — what to grab when the server is up but nobody can reach it
+# --------------------------------------------------------------------------
+#
+# Twice on 2026-08-25 (and once on 2026-08-24) vLLM finished startup cleanly —
+# weights loaded, CUDA graphs captured, `Application startup complete`, the
+# listener present on the right pid — and every connect to 127.0.0.1 timed out.
+# The client sat in SYN-SENT while the listener's accept queue stayed at
+# `Recv-Q 0`, so the SYN never reached the socket: below the application layer,
+# because a process that had merely stopped calling accept() would show
+# `Recv-Q > 0`.
+#
+# The mechanism is UNIDENTIFIED and this file does not guess at one. The point
+# of this capture is that the next bite opens a root-cause task with data
+# instead of a symptom, so it runs BEFORE any restore throws the state away.
+#
+# The diagnostic core is the kernel counter delta around a deliberate connect:
+# /proc/net/snmp and /proc/net/netstat carry TcpExt.ListenDrops,
+# ListenOverflows, TCPReqQFullDrop, Tcp.AttemptFails and friends. Which of them
+# moves — or that none of them moves — is the one cheap fact that narrows where
+# the SYN dies. Everything else here is context around that.
+
+EVIDENCE_KEEP = 20
+
+
+def evidence_dir() -> Path:
+    return state_dir() / "unreachable"
+
+
+def run_text(command: list[str], timeout: float = 15.0) -> str:
+    """Best-effort command output for the capture. A missing tool is recorded as
+    a missing tool: an absent section must never read as an empty result."""
+    try:
+        out = subprocess.run(command, capture_output=True, text=True,
+                             timeout=timeout)
+    except FileNotFoundError:
+        return f"({command[0]} not on PATH)"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"({command[0]} failed: {type(exc).__name__}: {exc})"
+    body = (out.stdout or "") + (out.stderr or "")
+    return body.strip() or f"(no output, rc={out.returncode})"
+
+
+def proc_net_counters() -> dict[str, int]:
+    """Flatten /proc/net/snmp and /proc/net/netstat into `Prefix.Key -> int`.
+
+    Both files are pairs of lines: a header naming the columns, then the values,
+    each prefixed by the same protocol tag. Rows whose tags disagree are skipped
+    rather than zipped into nonsense.
+    """
+    counters: dict[str, int] = {}
+    for path in ("/proc/net/snmp", "/proc/net/netstat"):
+        try:
+            lines = Path(path).read_text().splitlines()
+        except OSError:
+            continue
+        for header, values in zip(lines[::2], lines[1::2]):
+            head, data = header.split(), values.split()
+            if not head or not data or head[0] != data[0]:
+                continue
+            prefix = head[0].rstrip(":")
+            for key, value in zip(head[1:], data[1:]):
+                try:
+                    counters[f"{prefix}.{key}"] = int(value)
+                except ValueError:
+                    pass
+    return counters
+
+
+def connect_attempt(port: int, timeout: float = 5.0) -> str:
+    """One deliberate connect, described. This is the event the counter delta is
+    measured around, so it happens even though it is expected to fail."""
+    started = time.monotonic()
+    with socket.socket() as probe:
+        probe.settimeout(timeout)
+        try:
+            probe.connect((HOST, port))
+        except (TimeoutError, socket.timeout):
+            return f"TIMED OUT after {time.monotonic() - started:.1f}s"
+        except OSError as exc:
+            return (f"failed after {time.monotonic() - started:.1f}s: "
+                    f"errno {exc.errno} ({exc.strerror})")
+    return f"CONNECTED in {time.monotonic() - started:.1f}s"
+
+
+def prune_evidence(keep: int = EVIDENCE_KEEP) -> None:
+    """Bounded by count, and only over files this launcher itself named — the
+    glob is anchored to our own prefix so nothing else can be swept up."""
+    try:
+        captures = sorted(evidence_dir().glob("unreachable-*.txt"))
+    except OSError:
+        return
+    for stale in captures[:-keep] if len(captures) > keep else []:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def capture_unreachable_evidence(port: int, note: str) -> Path | None:
+    """Record why the port did not answer, before anything is torn down.
+
+    Returns the capture's path, or None if it could not be written — a failure
+    to capture must not stop the caller from restoring service.
+    """
+    stamp = time.strftime("%Y%m%dT%H%M%S%z")
+    live = read_state() or {}
+    vllm_pid = live.get("vllm_pid")
+
+    before = proc_net_counters()
+    attempt = connect_attempt(port)
+    # Sampled while the SYN-SENT socket from the attempt above may still exist:
+    # the client side is half the signature and it disappears within seconds.
+    sockets_during = run_text(["ss", "-tanp", "-o"])
+    after = proc_net_counters()
+    moved = {key: (before[key], value) for key, value in after.items()
+             if key in before and before[key] != value}
+
+    sections: list[tuple[str, str]] = [
+        ("note", note),
+        ("when", f"{stamp} (port {port}, host {HOST})"),
+        ("state", json.dumps(live, indent=2) if live else "(no state file)"),
+        ("connect attempt", attempt),
+        ("kernel counter DELTA across the attempt",
+         "\n".join(f"{key}: {old} -> {new}  (+{new - old})"
+                   for key, (old, new) in sorted(moved.items()))
+         or "(no counter moved — the SYN left no trace in snmp/netstat)"),
+        ("listener for this port", run_text(["ss", "-ltnp", f"sport = :{port}"])),
+        ("all tcp sockets + timers (sampled during the attempt)", sockets_during),
+        ("socket summary", run_text(["ss", "-s"])),
+        # The raw table is the fallback for a box where `ss` is missing, and it
+        # is also the only place the listener's queue depths appear as hex.
+        ("/proc/net/tcp (raw)", run_text(
+            ["sh", "-c", f"grep -i ':{port:04X}' /proc/net/tcp || true"])),
+        ("listening process", run_text(
+            ["sh", "-c", f"cat /proc/{vllm_pid}/status 2>/dev/null "
+                         "| head -20 || true"]) if vllm_pid else "(no vllm pid)"),
+        ("tcp sysctls", run_text(
+            ["sh", "-c", "sysctl net.ipv4.tcp_syncookies net.core.somaxconn "
+                         "net.ipv4.tcp_max_syn_backlog "
+                         "net.ipv4.tcp_abort_on_overflow 2>/dev/null || true"])),
+        ("interfaces", run_text(["ip", "-brief", "addr"])),
+        ("vram", run_text(["sh", "-c",
+                           "nvidia-smi --query-gpu=memory.used,memory.total "
+                           "--format=csv,noheader 2>/dev/null || true"])),
+        ("server log tail", run_text(
+            ["sh", "-c", f"tail -40 {log_path()} 2>/dev/null || true"])),
+    ]
+
+    body = f"# dsh-serve unreachable capture {stamp}\n"
+    for title, content in sections:
+        body += f"\n===== {title} =====\n{content}\n"
+
+    try:
+        evidence_dir().mkdir(parents=True, exist_ok=True)
+        path = evidence_dir() / f"unreachable-{stamp}.txt"
+        path.write_text(body)
+    except OSError as exc:
+        say(f"could not write the unreachable capture: {exc}")
+        return None
+    prune_evidence()
+    say(f"captured unreachable evidence -> {path}")
+    if moved:
+        say("kernel counters that moved across a connect attempt: "
+            + ", ".join(f"{key} +{new - old}"
+                        for key, (old, new) in sorted(moved.items())))
+    else:
+        say("no kernel counter moved across the connect attempt")
+    return path
+
+
+# --------------------------------------------------------------------------
+# the TCP -> Unix-socket proxy, and why it exists
+# --------------------------------------------------------------------------
+#
+# vLLM `bind()`s its TCP port at process start and only `listen()`s inside
+# uvicorn, after the whole engine build (`create_server_socket` — a deliberate
+# workaround for vllm#8204). On this box, every start whose bind->listen gap
+# exceeded ~100 s came up with a live listener that never received a SYN, and
+# every start under ~70 s was fine: 12 for 12, including one TEXT-ONLY failure
+# at 264 s, which is what rules vision out as the variable.
+#
+# ⚠️ That gap is the CORRELATE, not the mechanism. A synthetic socket bound for
+# 150 s and then listened on connects instantly, as does one whose bound fd is
+# held by a live forked child — so a long gap ALONE does not cause this, and
+# what breaks during a long vLLM start specifically is still unknown. Upstream
+# knows the symptom (vllm#31124, open) and `main` still binds without listening,
+# so there is no version to upgrade to.
+#
+# This proxy is right precisely BECAUSE it does not need the mechanism: vLLM
+# serves on a Unix socket, which has no SYN, no loopback TCP and no WSL
+# mirrored-networking layer, so the failure cannot arise there at all. The TCP
+# port consumers use is held by this proxy, which binds AND listens in the same
+# breath — the regime that has never failed.
+#
+# ⛔ Consumers must not be able to tell. `~/.dsh/settings.yaml` and the fleet
+# chat backend both name `http://127.0.0.1:8001/v1` and neither is touched.
+
+PROXY_CHUNK = 65536
+PROXY_UPSTREAM_CONNECT_S = 5.0
+PROXY_BACKLOG = 2048
+PROXY_BIND_TIMEOUT_S = 15.0    # a fresh interpreter parsing this file, no more
+
+
+def uds_path() -> Path:
+    return state_dir() / "vllm.sock"
+
+
+def uds_in_use(path: Path) -> bool:
+    """True if something is actually accepting on this socket file."""
+    if not path.exists():
+        return False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(2.0)
+    try:
+        probe.connect(str(path))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def prepare_uds(path: Path) -> str | None:
+    """Clear a stale socket file, or refuse if it is live. Returns an error."""
+    if uds_in_use(path):
+        return (f"{path} is already being served. Something outside this "
+                "launcher holds it — leave it alone, or stop it the way it was "
+                "started.")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        return f"cannot clear the stale socket {path}: {exc}"
+    return None
+
+
+async def proxy_serve(listen_port: int, uds: str) -> None:
+    """Relay 127.0.0.1:listen_port to the Unix socket, streaming both ways."""
+    async def pump(reader, writer) -> None:
+        try:
+            while True:
+                chunk = await reader.read(PROXY_CHUNK)
+                if not chunk:
+                    break
+                # Forwarded chunk by chunk and drained: a token stream must
+                # reach the client as it is produced. Accumulating a whole
+                # response here would turn streaming chat into a long silence
+                # followed by a wall of text.
+                writer.write(chunk)
+                await writer.drain()
+        except OSError:
+            pass
+        finally:
+            try:
+                writer.close()
+            except OSError:
+                pass
+
+    async def handle(client_reader, client_writer) -> None:
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(uds), PROXY_UPSTREAM_CONNECT_S)
+        except (OSError, asyncio.TimeoutError):
+            # vLLM is not up yet, or has gone. Close immediately: hanging here
+            # would reproduce the exact symptom this proxy exists to avoid.
+            try:
+                client_writer.close()
+            except OSError:
+                pass
+            return
+        await asyncio.gather(pump(client_reader, upstream_writer),
+                             pump(upstream_reader, client_writer))
+
+    server = await asyncio.start_server(handle, HOST, listen_port,
+                                        backlog=PROXY_BACKLOG)
+    async with server:
+        await server.serve_forever()
+
+
+def cmd_proxy(args: argparse.Namespace) -> int:
+    try:
+        asyncio.run(proxy_serve(args.port, args.uds))
+    except KeyboardInterrupt:
+        return RC_OK
+    except OSError as exc:
+        say(f"proxy on {HOST}:{args.port} failed: {exc}")
+        return RC_FAIL
+    return RC_OK
+
+
+def start_proxy(port: int, uds: str, log) -> subprocess.Popen | None:
+    """Launch the proxy as a CHILD PROCESS, deliberately.
+
+    A thread could die and leave this process holding the listening socket, so
+    consumers would connect and hang against a proxy that is no longer relaying
+    — the silent failure. A separate process cannot: when it dies the kernel
+    closes its socket, and 127.0.0.1:PORT starts refusing at once, which is
+    exactly what a dead server looks like.
+    """
+    command = [sys.executable, os.path.abspath(__file__), "_proxy",
+               "--port", str(port), "--uds", uds]
+    try:
+        proxy = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        say(f"cannot start the proxy: {exc}")
+        return None
+
+    # Return only once the port actually accepts. `Popen` returning proves a
+    # process exists, not that anything is listening, and everything after this
+    # — the recorded state, a caller's probe, the engine build — reads a live
+    # proxy pid as a served port. Whoever loses that race sees a connection
+    # refused on a port this launcher has already claimed to be holding.
+    deadline = time.monotonic() + PROXY_BIND_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if proxy.poll() is not None:
+            say(f"the proxy exited rc={proxy.returncode} before it bound "
+                f"{HOST}:{port}")
+            return None
+        if port_in_use(port):
+            return proxy
+        time.sleep(0.05)
+    say(f"the proxy did not bind {HOST}:{port} within "
+        f"{PROXY_BIND_TIMEOUT_S:.0f}s; refusing to build an engine behind a "
+        "port nothing is serving")
+    stop_proxy(proxy)
+    return None
+
+
+def stop_proxy(proxy: subprocess.Popen | None) -> None:
+    """Kill the proxy FIRST, so the TCP port refuses while teardown proceeds."""
+    if proxy is None or proxy.poll() is not None:
+        return
+    proxy.terminate()
+    try:
+        proxy.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proxy.kill()
+        proxy.wait()
+
+
+# --------------------------------------------------------------------------
+# _supervise — `arm run`'s direct child; the lease lives exactly as long as it
+# --------------------------------------------------------------------------
+
+def cmd_supervise(args: argparse.Namespace) -> int:
+    stopping = {"signal": None}
+
+    def request_stop(signum, _frame):
+        stopping["signal"] = signum
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, request_stop)
+
+    baseline = read_gpu_used_mib()
+    if baseline is None and args.arbitrated:
+        # Arbitrated box, unreadable card: we could never prove the VRAM came
+        # back, so the guarantee this process exists to make is unavailable.
+        say("cannot read nvidia-smi; refusing to take the card under a lease "
+            "whose release could not be justified")
+        return RC_ARM_ERROR
+    say(f"VRAM baseline before launch: "
+        f"{'unknown' if baseline is None else str(baseline) + ' MiB'}")
+
+    # The proxy goes up FIRST and stays up for the whole engine build. Holding
+    # the TCP port with a socket that binds and listens together is the entire
+    # point: vLLM's own port would sit bound-but-not-listening for that time.
+    proxy = None
+    if args.uds:
+        proxy = start_proxy(args.port, args.uds, sys.stdout)
+        if proxy is None:
+            return RC_FAIL
+        say(f"proxy pid {proxy.pid}: {HOST}:{args.port} -> {args.uds}")
+
+    command = [str(args.vllm_bin), *args.vllm_args]
+    say(f"launching: {' '.join(command)}")
+    try:
+        # Its own session, so its group id is its PID and every fork it makes —
+        # including VLLM::EngineCore — lands in that one recorded group.
+        child = subprocess.Popen(command, start_new_session=True,
+                                 env={**os.environ, **SERVER_ENV})
+    except OSError as exc:
+        say(f"cannot start {command[0]!r}: {exc}")
+        stop_proxy(proxy)
+        return RC_FAIL
+
+    # `start_new_session` should have made the child its own group leader. Read
+    # it back rather than assume: everything this script kills, it kills by this
+    # number, and a group id that is not one we created could name anybody's
+    # processes on a shared box.
+    try:
+        pgid = os.getpgid(child.pid)
+    except ProcessLookupError:
+        pgid = child.pid  # exited already; the group it led went with it
+    if pgid != child.pid:
+        say(f"REFUSING: {command[0]!r} landed in process group {pgid}, not its "
+            f"own ({child.pid}). Tearing it down by PID and stopping, rather "
+            "than taking a group this launcher did not create.")
+        child.terminate()
+        child.wait()
+        stop_proxy(proxy)
+        return RC_FAIL
+
+    wrapper_pid = os.getppid()            # `arm run`, or `start` when unclaimed
+    write_state({
+        "phase": "serving",
+        "serve_args": list(args.vllm_args),
+        "wrapper_pid": wrapper_pid,
+        "wrapper_start_ticks": pid_start_ticks(wrapper_pid),
+        "supervisor_pid": os.getpid(),
+        "supervisor_start_ticks": pid_start_ticks(os.getpid()),
+        "vllm_pid": child.pid,
+        "vllm_pgid": pgid,
+        "proxy_pid": proxy.pid if proxy else None,
+        "uds": args.uds,
+        "vram_baseline_mib": baseline,
+        "arbitrated": args.arbitrated,
+        "host": HOST,
+        "port": args.port,
+        "model": SERVED_MODEL_NAME,
+        # Stamped here, after the exec above — not at verb invocation. It is
+        # the wall clock's reading of when this vLLM began, to within the
+        # milliseconds between `Popen` and this line.
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+    say(f"vllm pid {child.pid}, process group {pgid}")
+
+    proxy_died = False
+    became_healthy = False
+    consecutive_misses = 0
+    mid_session_captured = False
+    next_probe = time.monotonic()  # check immediately, not after one interval
+    while child.poll() is None and stopping["signal"] is None:
+        if proxy is not None and proxy.poll() is not None:
+            proxy_died = True
+            break
+        now = time.monotonic()
+        if now >= next_probe:
+            next_probe = now + MID_SESSION_PROBE_INTERVAL_S
+            if server_ready(args.port):
+                became_healthy = True
+                consecutive_misses = 0
+                mid_session_captured = False
+            elif became_healthy:
+                # Gated on `became_healthy`: a server that never came up at all
+                # is `await_ready`'s own capture, in a different process — this
+                # one is specifically for "answered fine, then stopped", which
+                # nothing else here watches for.
+                consecutive_misses += 1
+                if (consecutive_misses >= MID_SESSION_MISS_THRESHOLD
+                        and not mid_session_captured):
+                    mid_session_captured = True
+                    say(f"WARNING: /health has missed "
+                        f"{consecutive_misses} times in a row "
+                        f"({MID_SESSION_PROBE_INTERVAL_S:.0f}s apart) after "
+                        "answering fine earlier this session — capturing "
+                        "evidence. NOT restarting or stopping anything; a "
+                        "human decides what to do with this.")
+                    capture_unreachable_evidence(
+                        args.port,
+                        f"/health stopped answering mid-session: "
+                        f"{consecutive_misses} consecutive misses "
+                        f"{MID_SESSION_PROBE_INTERVAL_S:.0f}s apart, "
+                        "following at least one earlier successful /health "
+                        "this session (not a startup failure)")
+        time.sleep(0.2)
+
+    if proxy_died:
+        # A live engine nobody can reach is the silent failure this whole
+        # exercise exists to avoid, so it is fatal rather than a warning: shut
+        # down, give the card back, and let the operator see why.
+        say(f"PROXY DIED rc={proxy.returncode} while vllm was still running. "
+            f"{HOST}:{args.port} is no longer served, so the engine is "
+            "unreachable — tearing down rather than holding the card for a "
+            "server nobody can talk to.")
+    elif stopping["signal"] is not None:
+        say(f"got signal {stopping['signal']}; tearing down process group {pgid}")
+    else:
+        # The direct child exited on its own. This is exactly the path where a
+        # bare `arm run` would release over a full card.
+        say(f"vllm exited rc={child.returncode}; sweeping process group {pgid} "
+            "for survivors before releasing anything")
+
+    # Before the engine, so the TCP port starts refusing immediately instead of
+    # relaying into a server that is shutting down under it.
+    stop_proxy(proxy)
+    rc = teardown(child, pgid, baseline, args.arbitrated, args.vram_timeout)
+    try:
+        state_path().unlink()
+    except OSError:
+        pass
+    if args.uds:
+        try:
+            Path(args.uds).unlink()
+        except OSError:
+            pass
+    return rc if not proxy_died else RC_FAIL
+
+
+def teardown(child: subprocess.Popen, pgid: int, baseline: int | None,
+             arbitrated: bool, vram_timeout: float) -> int:
+    """Empty the recorded group, then prove the VRAM came back. Only then may
+    this process exit, because its exit is what releases the lease."""
+    # Signal the group BEFORE reaping. While the group leader is an unreaped
+    # child of ours its PID cannot be recycled, and a group id is its leader's
+    # PID — so `pgid` cannot come to mean somebody else's processes here.
+    for sig, grace in ((signal.SIGTERM, TERM_GRACE_S), (signal.SIGKILL, 10.0)):
+        remaining = pgid_members(pgid)
+        if not remaining:
+            break
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            break
+        say(f"sent {sig.name} to process group {pgid} ({len(remaining)} member(s))")
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline and pgid_members(pgid):
+            time.sleep(0.1)
+
+    survivors = pgid_members(pgid)
+    rc = child.wait()
+    rc = 128 - rc if rc < 0 else rc
+
+    if not confirm_card_returned(baseline, pgid, survivors, arbitrated,
+                                 vram_timeout):
+        return RC_VRAM_HELD
+    return rc
+
+
+def confirm_card_returned(baseline: int | None, pgid: int, survivors: list[int],
+                          arbitrated: bool, vram_timeout: float) -> bool:
+    """True once nothing this launcher started still holds the card.
+
+    Two pieces of evidence, in order of directness. The recorded process group
+    being empty is the primary one — it is exact, and it is the thing under this
+    launcher's control. The `nvidia-smi` reading is the check on top of it,
+    because the figure is device-wide (per-process attribution is blind under
+    WSL2) and can lag the driver's reclaim.
+    """
+    if survivors:
+        return hold_or_warn(
+            arbitrated,
+            f"process group {pgid} still has members after SIGKILL: {survivors}. "
+            "Something this launcher started is still on the card.")
+
+    if baseline is None:
+        # Only reachable if nvidia-smi disappeared mid-run; `_supervise` refuses
+        # to start an arbitrated run without a baseline. The group is provably
+        # empty, which is the stronger evidence, so this warns rather than
+        # stranding the pool on a reading that will never arrive.
+        say(f"WARNING: process group {pgid} is empty, but nvidia-smi cannot be "
+            "read, so the VRAM's return is unverified")
+        return False
+
+    ceiling = baseline + VRAM_RETURNED_TOLERANCE_MIB
+    deadline = time.monotonic() + vram_timeout
+    while True:
+        used = read_gpu_used_mib()
+        if used is not None and used <= ceiling:
+            say(f"VRAM returned: {used} MiB in use, baseline {baseline} MiB")
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1.0)
+
+    seen = read_gpu_used_mib()
+    return hold_or_warn(
+        arbitrated,
+        f"VRAM did not return within {vram_timeout:.0f}s (in use "
+        f"{'unreadable' if seen is None else str(seen) + ' MiB'}, baseline "
+        f"{baseline} MiB) after emptying process group {pgid}.")
+
+
+def hold_or_warn(arbitrated: bool, finding: str) -> bool:
+    """Never release a lease over a card that is still held.
+
+    Under a lease this does not return: it keeps the pool marked busy and says
+    why, forever. An over-held lease costs a queue and is visible in
+    `arm status`; an under-held one hands the next tenant a full card, and on
+    WSL2 that does not fail — it spills to host memory and quietly runs 10-40x
+    slower.
+    """
+    if not arbitrated:
+        say(f"WARNING: {finding} No lease is held, so nothing is being promised "
+            "to anyone — but the card is not free.")
+        return False
+    # SIGTERM is already spoken for as "begin an orderly stop", and this IS the
+    # orderly stop, refusing to finish. Releasing anyway has to be a separate,
+    # deliberate act, so it takes SIGKILL — which a repeated `dsh-serve stop`
+    # cannot do by accident.
+    say(f"REFUSING TO RELEASE: {finding} Holding the {POOL} lease so ARM keeps "
+        f"the card marked busy. Investigate with `arm audit`. Once the card is "
+        f"genuinely free, release it with `kill -9 {os.getpid()}` — SIGTERM "
+        "will not do it.")
+    while True:
+        time.sleep(STUCK_REPORT_INTERVAL_S)
+        seen = read_gpu_used_mib()
+        say(f"still holding the {POOL} lease: VRAM in use "
+            f"{'unreadable' if seen is None else str(seen) + ' MiB'}, "
+            f"supervisor pid {os.getpid()}")
+
+
+# --------------------------------------------------------------------------
+# start
+# --------------------------------------------------------------------------
+
+def cmd_start(args: argparse.Namespace) -> int:
+    if args.prio and args.prio != REGISTERED_PRIO and not args.purpose:
+        die(f"--prio {args.prio} overrides the registered default "
+            f"({REGISTERED_PRIO}); state the reason in --purpose", RC_FAIL)
+
+    # Held for the whole verb, so two callers cannot both pass the checks below
+    # and then both spawn. A machine caller makes that race reachable in a way a
+    # human at a terminal never did.
+    lock = take_start_lock()
+    if lock is None:
+        die("another `dsh-serve start` is in progress (it holds "
+            f"{lock_path()}). Wait for it, then read `dsh-serve status`.",
+            RC_FAIL)
+
+    uds = str(uds_path()) if getattr(args, "uds", False) else None
+    profile_name, profile = resolve_profile(getattr(args, "model", None))
+    serve_args = [*vllm_args(profile, args.port, uds), *args.vllm_args]
+
+    live = read_state()
+    if live and (pid_alive(live.get("supervisor_pid"),
+                           live.get("supervisor_start_ticks"))
+                 or pid_alive(live.get("wrapper_pid"),
+                              live.get("wrapper_start_ticks"))):
+        where = (f"supervisor pid {live.get('supervisor_pid')}, "
+                 f"vllm pid {live.get('vllm_pid')}"
+                 if state_phase(live) == "serving"
+                 else f"a start is in flight (wrapper pid "
+                      f"{live.get('wrapper_pid')})")
+        if not args.if_not_running:
+            die(f"already running: {where}. Use `dsh-serve stop`, or "
+                "`start --if-not-running` to accept it.", RC_ALREADY_RUNNING)
+        return accept_running(live, serve_args)
+    if port_in_use(args.port):
+        die(f"{HOST}:{args.port} is already serving. Something outside this "
+            "launcher holds the card — leave it alone, or stop it the way it "
+            "was started.", RC_FAIL)
+
+    vllm_bin = Path(args.vllm_bin)
+    if not os.access(vllm_bin, os.X_OK):
+        die(f"vllm not executable at {vllm_bin}", RC_FAIL)
+
+    if uds:
+        state_dir().mkdir(parents=True, exist_ok=True)
+        stale = prepare_uds(Path(uds))
+        if stale:
+            die(stale, RC_FAIL)
+
+    incoherent = check_kv_pool_fits_window(serve_args)
+    if incoherent:
+        die(incoherent, RC_FAIL)
+
+    drifted = check_settings_context_window(profile["max_model_len"])
+    if drifted:
+        die(drifted, RC_FAIL)
+
+    # Books, not binary: a missing PATH entry must never read as "no arbiter".
+    arbitrated = books_path().exists()
+    if arbitrated and not arm_available():
+        die(f"{books_path()} says this box is arbitrated, but `arm` cannot be "
+            "run. That is a refusal, not an absence of arbitration — this "
+            "would take 25 GB of a shared card behind ARM's back. Fix the PATH "
+            "(prepend ~/bin) or the ARM install.", RC_ARM_ERROR)
+    if not arbitrated:
+        say(f"no {books_path()} — no arbiter on this box; starting UNCLAIMED")
+
+    prio = args.prio or REGISTERED_PRIO
+    purpose = args.purpose or (
+        f"dsh: {SERVED_MODEL_NAME} ({profile_name}) NVFP4 vLLM server on "
+        f"{HOST}:{args.port} (deepseek-harness backend)")
+
+    supervise = [
+        sys.executable, os.path.abspath(__file__), "_supervise",
+        "--vllm-bin", str(vllm_bin), "--port", str(args.port),
+        "--vram-timeout", str(args.vram_timeout),
+    ]
+    if uds:
+        supervise += ["--uds", uds]
+    if arbitrated:
+        supervise.append("--arbitrated")
+    supervise += ["--", *serve_args]
+
+    if arbitrated:
+        command = [
+            "arm", "run", POOL, "--app", APP, "--exclusive",
+            "--prio", prio, "--purpose", purpose,
+        ]
+        if args.wait:
+            command += ["--wait", "--timeout", str(args.wait)]
+        command += ["--", *supervise]
+    else:
+        command = supervise
+
+    state_dir().mkdir(parents=True, exist_ok=True)
+    log = open(log_path(), "a")
+    log.write(f"\n=== dsh-serve start {time.strftime('%Y-%m-%dT%H:%M:%S%z')} ===\n")
+    log.flush()
+    say(f"logging to {log_path()}")
+    # setsid: the wrapper is the lease holder and must outlive this process
+    # without inheriting its terminal (`arm run`'s documented detached shape).
+    wrapper = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                               stdin=subprocess.DEVNULL, start_new_session=True)
+
+    # Recorded HERE, before anything is serving, because this is what makes a
+    # `stop` arriving mid-start safe. The supervisor's own record lands minutes
+    # later — after the ARM queue and the VRAM baseline — and until 2026-08-27
+    # nothing existed in between: `stop` found no state, said "nothing is
+    # running", exited 0, and left a server that was still on its way up to take
+    # the card unattended. The window is unbounded when the claim is queued.
+    write_state({
+        "phase": "starting",
+        "wrapper_pid": wrapper.pid,
+        "wrapper_start_ticks": pid_start_ticks(wrapper.pid),
+        "arbitrated": arbitrated,
+        "host": HOST,
+        "port": args.port,
+        "uds": uds,
+        "model": SERVED_MODEL_NAME,
+        "profile": profile_name,
+        "serve_args": serve_args,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+
+    rc = await_ready(wrapper, arbitrated, args.ready_timeout, args.port, uds)
+    log.close()
+    if rc != RC_OK and wrapper.poll() is not None:
+        clear_starting_state(wrapper.pid)
+    return rc
+
+
+def clear_starting_state(wrapper_pid: int) -> None:
+    """Remove OUR `starting` record once the wrapper is gone without serving.
+
+    Conditioned on the phase and the pid: a supervisor that got as far as
+    serving has already overwritten this record, and deleting that one would
+    strand a live server with no way to stop it.
+    """
+    live = read_state()
+    if (live and state_phase(live) == "starting"
+            and live.get("wrapper_pid") == wrapper_pid):
+        try:
+            state_path().unlink()
+        except OSError:
+            pass
+
+
+def warn_unreachable_likely(elapsed_s: float) -> None:
+    """Fires once per attempt, direct-TCP only, past
+    `DIRECT_TCP_UNREACHABLE_WARN_S`. A WARNING, never an abort: a legitimately
+    slow load must still be allowed to finish, so this never touches the
+    wait's outcome, only what a human watching can see about it.
+
+    Printed on stderr (`say`) AND appended to `server.log` directly, because
+    neither alone is enough: `say`'s periodic progress lines never reach
+    `server.log` (they go only to this process's own stderr), so a start
+    launched detached or into a redirect nobody is watching would otherwise
+    say this to no one; the log-only half would miss the one person actually
+    staring at a hand-typed `dsh-serve start` at the terminal, which is the
+    worst-case scenario this exists for (see
+    vllm-loopback-unreachable-after-config-change memory, 2026-09-03 incident).
+    """
+    message = (
+        f"⚠️  {elapsed_s:.0f}s since launch with no /health response yet, on "
+        f"direct TCP (no --uds). In this box's own history, EVERY direct-TCP "
+        f"start that took {DIRECT_TCP_UNREACHABLE_WARN_S:.0f}s or longer to "
+        "reach 'HTTP server started' went permanently unreachable (0/14), "
+        "against 6/6 reachable under 68s — this is very likely wedged, not "
+        "still loading. It will keep holding the GPU until the full "
+        "--ready-timeout deadline (or `dsh-serve stop`) either way, so "
+        "there is no harm in checking now: `dsh-serve status`. If it agrees, "
+        "`dsh-serve stop` then retry with `dsh-serve start --uds` (13/13 "
+        "reachable in the same history, any duration).")
+    say(message)
+    try:
+        with open(log_path(), "a") as log:
+            log.write(f"dsh-serve: {message}\n")
+    except OSError:
+        pass  # the stderr line above is the guarantee; a log write is a bonus
+
+
+def await_ready(wrapper: subprocess.Popen, arbitrated: bool,
+                timeout_s: float, port: int, uds: str | None) -> int:
+    """Poll for the server, watching the wrapper for an early exit — an ARM
+    pre-exec refusal must surface in seconds, not after the readiness timeout."""
+    started = time.monotonic()
+    deadline = started + timeout_s
+    next_report = started + 15
+    warned_unreachable = False
+    while time.monotonic() < deadline:
+        rc = wrapper.poll()
+        if rc is not None:
+            return report_wrapper_exit(rc, arbitrated)
+        if server_ready(port):
+            live = read_state() or {}
+            used = read_gpu_used_mib()
+            say(f"ready: {SERVED_MODEL_NAME} on http://{HOST}:{port} "
+                f"(vllm pid {live.get('vllm_pid')}, group {live.get('vllm_pgid')}"
+                f"{'' if used is None else f', {used} MiB VRAM in use'})")
+            if arbitrated:
+                say(f"holding the {POOL} lease as `{APP}`; `dsh-serve stop` "
+                    "gives the card back")
+            return RC_OK
+        elapsed = time.monotonic() - started
+        if (not warned_unreachable and uds is None
+                and elapsed >= DIRECT_TCP_UNREACHABLE_WARN_S):
+            warned_unreachable = True
+            warn_unreachable_likely(elapsed)
+        if time.monotonic() >= next_report:
+            # The state file appears when the server process starts, which is
+            # what tells these two apart: queued for the pool is not the same
+            # wait as loading weights, and reporting one as the other sends the
+            # operator looking in the wrong place.
+            live = read_state()
+            if live is None:
+                say(f"waiting: no server process yet — queued for the {POOL} "
+                    "lease, or still starting")
+            else:
+                say(f"waiting: vllm pid {live.get('vllm_pid')} is up, loading "
+                    "weights (~4 min cold, ~1 min with warm caches)")
+            next_report = time.monotonic() + 60
+        time.sleep(1.0)
+
+    # The capture happens here, while the failed server is still up: every
+    # section below is about a live listener that will not answer, and stopping
+    # first would destroy the only state worth having.
+    capture_unreachable_evidence(
+        port, f"/health did not answer within {timeout_s:.0f}s of `dsh-serve start`")
+    say(f"server did not answer /health within {timeout_s:.0f}s; the wrapper is "
+        f"still running (pid {wrapper.pid}) and the card is still held. See "
+        f"{log_path()}, then `dsh-serve stop` — this does NOT tear down by "
+        "itself, deliberately: the failed server is the evidence.")
+    return RC_READY_TIMEOUT
+
+
+def report_wrapper_exit(rc: int, arbitrated: bool) -> int:
+    """Map an exit that happened before the server came up. `arm run`'s pre-exec
+    band (97/98/99) means the child never ran at all."""
+    tail = ""
+    try:
+        with open(log_path()) as handle:
+            tail = "".join(handle.readlines()[-15:])
+    except OSError:
+        pass
+    if arbitrated and rc == ARM_RC_DENIED:
+        say(f"ARM DENIED the claim (rc {rc}). This call is wrong, not early: "
+            f"`{APP}` is probably not registered in {books_path()}. Retrying "
+            "changes nothing.")
+        outcome = RC_DENIED
+    elif arbitrated and rc == ARM_RC_WOULD_BLOCK:
+        who = describe_blockers()
+        say(f"ARM WOULD BLOCK (rc {rc}) — the GPU is not free"
+            f"{': ' + who if who else ''}. Not starting. Retry later, or "
+            "`--wait SECS`.")
+        outcome = RC_WOULD_BLOCK
+    elif arbitrated and rc == ARM_RC_ERROR:
+        say(f"ARM could not answer (rc {rc}). That is a refusal, never "
+            "permission — not starting.")
+        outcome = RC_ARM_ERROR
+    else:
+        say(f"the server process exited rc={rc} before answering /health")
+        outcome = RC_FAIL
+    if tail.strip():
+        print(f"--- last lines of {log_path()} ---\n{tail}", file=sys.stderr)
+    return outcome
+
+
+# --------------------------------------------------------------------------
+# try-vision — the guarded start: prove the eyes, or put the old server back
+# --------------------------------------------------------------------------
+#
+# TD ruling, 2026-08-25: vision ships on the operator's word, and the start that
+# ships it IS the end-to-end image test. Measurement established that the tower
+# fits with the 128k window intact (see VISION_ARGS), but no image was ever
+# served — two vision boots came up unreachable. So the one thing this verb must
+# guarantee is that the operator's chat is working when it returns, whatever
+# happened in between.
+#
+# Three outcomes, and only the first leaves vision running:
+#   * server answers AND names the colour  -> vision verified, left serving
+#   * server never answers by the deadline -> capture, restore text-only
+#   * server answers but fails the image   -> capture, restore text-only
+#
+# The image test asserts on what the model SAYS, not on a 200. A 200 only proves
+# the request was accepted; the colour proves the tower actually ran and its
+# output reached the language model.
+
+VISION_PROBE_RGB = (220, 20, 20)
+VISION_PROBE_WORD = "red"
+VISION_PROBE_EDGE = 256
+
+
+def solid_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
+    """A minimal 8-bit RGB PNG, built here so the probe needs no image library —
+    this script runs under system Python, not the vLLM venv."""
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    scanlines = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(scanlines, 9))
+            + chunk(b"IEND", b""))
+
+
+def image_probe(port: int, timeout: float = 180.0) -> tuple[bool, str]:
+    """Send one image and check the answer. Returns (passed, what happened)."""
+    png = solid_png(VISION_PROBE_EDGE, VISION_PROBE_EDGE, VISION_PROBE_RGB)
+    payload = {
+        "model": SERVED_MODEL_NAME,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(png).decode()}},
+            {"type": "text",
+             "text": "What single colour fills this image? Reply with one word."},
+        ]}],
+        "max_tokens": 16,
+        "temperature": 0,
+        # With thinking on, a small cap is consumed inside the think block and
+        # `content` comes back null — which would fail the probe for the wrong
+        # reason entirely.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    request = urllib.request.Request(
+        f"http://{HOST}:{port}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            answer = json.load(response)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:400]
+        return False, f"HTTP {exc.code}: {detail}"
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return False, f"no answer: {type(exc).__name__}: {exc}"
+
+    try:
+        content = (answer["choices"][0]["message"].get("content") or "").strip()
+        prompt_tokens = (answer.get("usage") or {}).get("prompt_tokens")
+    except (KeyError, IndexError, TypeError) as exc:
+        return False, f"unreadable response: {type(exc).__name__}: {exc}"
+
+    got = f"answered {content!r} (prompt_tokens {prompt_tokens})"
+    if VISION_PROBE_WORD not in content.lower():
+        return False, f"the image was not seen correctly: {got}"
+    return True, got
+
+
+def start_namespace(args: argparse.Namespace, extra: list[str],
+                    ready_timeout: float, *, uds: bool,
+                    model: str | None) -> argparse.Namespace:
+    """`start`'s arguments for one attempt. Built explicitly rather than mutated
+    so the vision attempt and the restore cannot share a flag by accident.
+
+    `model` is a required keyword, not read off `args.model`: the one caller
+    that must NOT honor the request (`restore_known_good`) passes
+    `KNOWN_GOOD_PROFILE` here explicitly, so the restore is structurally
+    incapable of retrying whatever profile the failed attempt used.
+    """
+    return argparse.Namespace(
+        prio=args.prio, purpose=args.purpose, wait=args.wait,
+        vllm_bin=args.vllm_bin, port=args.port, uds=uds,
+        ready_timeout=ready_timeout, vram_timeout=args.vram_timeout,
+        # Never: an attempt that accepted a server it did not start would report
+        # the eyes proven on a configuration it never launched.
+        if_not_running=False, json=False,
+        model=model,
+        vllm_args=list(extra))
+
+
+def stop_running(reason: str, timeout: float) -> bool:
+    """Stop whatever this launcher has running. True if the card is free after."""
+    live = read_state()
+    if not (live and (pid_alive(live.get("supervisor_pid"),
+                                live.get("supervisor_start_ticks"))
+                      or pid_alive(live.get("wrapper_pid"),
+                                   live.get("wrapper_start_ticks")))):
+        return True
+    say(f"stopping the running server: {reason}")
+    return cmd_stop(argparse.Namespace(timeout=timeout, json=False)) == RC_OK
+
+
+def restore_known_good(args: argparse.Namespace, why: str) -> int:
+    """Put the text-only server back. This is the promise the verb makes.
+
+    ⚠️ The restore lands on `--restore-port`, NOT on the port the attempt used.
+    A test on another port must never be able to strand the operator's chat on a
+    port nothing points at: `~/.dsh/settings.yaml` and the fleet chat's backend
+    both name the shipped port, and neither is updated by this script.
+
+    ⛔ KNOWN GOOD is defined as: the register's `KNOWN_GOOD_PROFILE`, text-only,
+    direct TCP, no proxy, no experiment arguments, on `--restore-port`. That is
+    the exact configuration the operator has been served by, and the only one
+    with a record of coming up.
+
+    ⛔ The profile is `KNOWN_GOOD_PROFILE` from the register, NEVER `args.model`
+    — the defect this closes (2026-08-30): a restore that re-read whatever
+    profile the failed attempt used could retry the exact broken checkpoint
+    it exists to fall back FROM. `start_namespace`'s `model` keyword is
+    required specifically so this call cannot silently default to `args.model`
+    by omission. The restore also never inherits `--uds` from the attempt,
+    because a restore into an unproven path is not a restore.
+    """
+    known_good = load_register()["KNOWN_GOOD_PROFILE"]
+    say(f"RESTORING the known-good server ({known_good}) on port "
+        f"{args.restore_port} — text-only, direct TCP, no proxy ({why})")
+    if not stop_running("clearing the failed vision attempt", STOP_WAIT_S):
+        say("RESTORE BLOCKED: the failed server would not give the card back. "
+            "The lease is deliberately still held. Investigate before retrying.")
+        return RC_RESTORE_FAILED
+    restore = start_namespace(args, [], args.restore_timeout, uds=False,
+                              model=known_good)
+    restore.port = args.restore_port
+    rc = cmd_start(restore)
+    if rc != RC_OK:
+        say("RESTORE FAILED: the known-good text-only config did not come up "
+            "either. The chat is DOWN and needs a human now.")
+        return RC_RESTORE_FAILED
+    say("restored: the text-only server is serving again, unchanged. Vision is "
+        "OFF and nothing about the shipped configuration has moved.")
+    return RC_FAIL
+
+
+def accept_proven_vision(port: int) -> int | None:
+    """`--if-not-running`: is the server that is already up captioning-ready?
+
+    Returns RC_OK when an image round-trips through it right now, None to fall
+    through to the full guarded start. The test is the round trip, never the
+    recorded arguments — this verb's whole promise is that the eyes are proven
+    rather than requested, and a consumer gating a chapter of captions on it
+    needs that promise to mean the same thing on the idempotent path.
+
+    ⛔ Deliberately does NOT restart a server that is already serving the
+    operator's chat. Flipping `language_model_only` costs ~7 min of downtime,
+    and doing that to prove something already true is the cost this flag exists
+    to avoid.
+    """
+    live = read_state()
+    if not (live and state_phase(live) == "serving"
+            and pid_alive(live.get("supervisor_pid"),
+                          live.get("supervisor_start_ticks"))):
+        return None
+    if live_port(live) != port or not server_ready(port):
+        return None
+    say(f"a server is already serving on {HOST}:{port}; testing it for the eyes "
+        "before considering a restart")
+    passed, detail = image_probe(port)
+    if not passed:
+        say(f"it is up but cannot take an image ({detail}); continuing with the "
+            "guarded vision start")
+        return None
+    mark_vision_proven(port)
+    say(f"VISION ALREADY PROVEN on the running server: {detail}. Nothing was "
+        "restarted.")
+    return RC_OK
+
+
+def cmd_try_vision(args: argparse.Namespace) -> int:
+    """Bring the server up with the vision tower and prove an image round-trips,
+    or put the known-good text-only server back."""
+    if args.if_not_running:
+        already = accept_proven_vision(args.port)
+        if already is not None:
+            return already
+
+    say(f"guarded vision start: deadline {args.deadline:.0f}s, then automatic "
+        f"restore. Expect ~7 min of downtime — flipping "
+        f"`language_model_only` invalidates vLLM's compile cache either way.")
+
+    if not stop_running("try-vision replaces it with the vision config",
+                        STOP_WAIT_S):
+        die("could not stop the running server; not attempting vision. The "
+            "card was never re-claimed, so nothing has changed.", RC_FAIL)
+
+    extra = [*VISION_ARGS, *args.vllm_args]
+    if args.vllm_args:
+        say(f"experiment arguments on the attempt only: {' '.join(args.vllm_args)}")
+    if args.uds:
+        say("attempt serves vLLM on a Unix socket behind this launcher's proxy; "
+            "the restore stays direct TCP either way")
+    rc = cmd_start(start_namespace(args, extra, args.deadline, uds=args.uds,
+                                   model=args.model))
+    if rc != RC_OK:
+        # A pre-exec ARM refusal means the child never ran, so there is nothing
+        # to restore from and nothing was disturbed — say so instead of
+        # bouncing a server that is already down for a different reason.
+        if rc in (RC_DENIED, RC_WOULD_BLOCK, RC_ARM_ERROR):
+            say("ARM refused the vision attempt before anything started; the "
+                "server is down and no restore was attempted. Re-run "
+                "`dsh-serve start` when the card is free.")
+            return rc
+        # await_ready already captured the evidence, while the server was up.
+        return restore_known_good(args, "the vision server never answered")
+
+    say("vision server is up; running the end-to-end image test")
+    passed, detail = image_probe(args.port)
+    if not passed:
+        say(f"IMAGE TEST FAILED: {detail}")
+        capture_unreachable_evidence(
+            args.port, f"vision server answered /health but failed the image "
+                       f"test: {detail}")
+        return restore_known_good(args, "the image test failed")
+
+    mark_vision_proven(args.port)
+    used = read_gpu_used_mib()
+    say(f"VISION VERIFIED end to end: {detail}")
+    say(f"leaving it serving on http://{HOST}:{args.port}"
+        f"{'' if used is None else f'; {used} MiB VRAM in use'}. "
+        "`dsh-serve start` (no try-vision) returns to text-only.")
+    if args.port != args.restore_port:
+        say(f"⚠️ this is port {args.port}, NOT the shipped {args.restore_port}. "
+            "~/.dsh/settings.yaml and the fleet chat's backend both name the "
+            "shipped port and neither was touched, so nothing is pointing here "
+            "yet. A permanent move is a two-consumer seam, not this verb's job.")
+    return RC_OK
+
+
+# --------------------------------------------------------------------------
+# stop / status
+# --------------------------------------------------------------------------
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Give the card back, and prove it.
+
+    On the `--uds` path (default for `start` since 2026-09-04), an in-flight
+    request is cut slightly EARLIER than on direct TCP: the proxy is torn
+    down before the engine (`cmd_supervise`, "before the engine, so the TCP
+    port starts refusing immediately"), so the client sees the port refuse
+    rather than the engine's own shutdown sequence being the first thing it
+    observes. Not a new risk — `stop` always cuts rather than drains either
+    way (`shutdown_timeout` defaults to 0) — just a documented behavior
+    difference now that it is what most operators meet by default.
+    """
+    live = read_state()
+    if not live:
+        say(f"no {state_path()} — nothing started by this launcher is running")
+        return RC_OK if not port_in_use(live_port(live)) else RC_FAIL
+    supervisor = live.get("supervisor_pid")
+    supervisor_ticks = live.get("supervisor_start_ticks")
+    wrapper = live.get("wrapper_pid")
+    wrapper_ticks = live.get("wrapper_start_ticks")
+    phase = state_phase(live)
+    arbitrated = live.get("arbitrated")
+
+    def wrapper_holds_the_lease() -> bool:
+        """Whether the recorded wrapper is a process whose exit means something.
+
+        Only `arm run` and a start still in flight qualify. Unclaimed, a
+        supervisor records its own parent — the transient `start` process — and
+        that parent can be the very process calling `stop`: `try-vision` stops
+        the server it started from inside the verb that started it. Waiting for
+        that to exit is a wait for ourselves.
+        """
+        if not pid_alive(wrapper, wrapper_ticks):
+            return False
+        if wrapper in (os.getpid(), os.getppid()):
+            return False
+        return bool(arbitrated) or phase == "starting"
+
+    def ours_alive() -> bool:
+        return pid_alive(supervisor, supervisor_ticks) or wrapper_holds_the_lease()
+
+    if not ours_alive():
+        say(f"recorded {'wrapper' if phase == 'starting' else 'supervisor'} pid "
+            f"{wrapper if phase == 'starting' else supervisor} is gone; "
+            "clearing stale state")
+        try:
+            state_path().unlink()
+        except OSError:
+            pass
+        return RC_OK
+
+    # Signal the wrapper, not the supervisor: `arm run` forwards SIGTERM to its
+    # child's group and then releases only after that child exits — which is
+    # after the supervisor has proved the VRAM came back. Mid-start there is no
+    # supervisor yet and the wrapper is the only thing to signal, which is the
+    # whole reason `start` records one before it has anything to serve.
+    target = wrapper if wrapper_holds_the_lease() else supervisor
+    say(f"stopping{' a start in flight' if phase == 'starting' else ''}: "
+        f"SIGTERM to pid {target}; waiting for the card to come back")
+    try:
+        os.kill(target, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    baseline = live.get("vram_baseline_mib")
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        # The supervisor may have got as far as recording a baseline after this
+        # verb read the file; without re-reading, its own evidence for whether
+        # the card came back would be thrown away.
+        if baseline is None:
+            baseline = (read_state() or {}).get("vram_baseline_mib")
+        if not ours_alive():
+            break
+        time.sleep(0.5)
+    else:
+        used = read_gpu_used_mib()
+        say(f"NOT STOPPED: pid {target} is still alive after "
+            f"{args.timeout:.0f}s. VRAM in use: "
+            f"{'unreadable' if used is None else str(used) + ' MiB'}. It holds "
+            f"the {POOL} lease on purpose while the card is not demonstrably "
+            f"free — see {log_path()}.")
+        return RC_VRAM_HELD
+
+    if baseline is None and phase == "starting":
+        # No baseline was ever recorded, and the supervisor records one BEFORE
+        # it spawns vLLM: nothing of ours reached the card, so there is nothing
+        # to prove came back.
+        try:
+            state_path().unlink()
+        except OSError:
+            pass
+        say("stopped before the server was launched; nothing of this "
+            f"launcher's had loaded on the card{'' if not arbitrated else f'; {POOL} lease released'}")
+        return RC_OK
+
+    used = read_gpu_used_mib()
+    if used is None:
+        say(f"NOT CONFIRMED: the supervisor exited, but nvidia-smi cannot be "
+            "read here, so the VRAM's return is unverified. Do not treat the "
+            "card as free.")
+        return RC_VRAM_HELD
+    if baseline is not None and used > baseline + VRAM_RETURNED_TOLERANCE_MIB:
+        say(f"NOT CONFIRMED: the supervisor exited but {used} MiB is still in "
+            f"use against a {baseline} MiB baseline. Run `arm audit`.")
+        return RC_VRAM_HELD
+
+    say(f"stopped; VRAM in use {used} MiB"
+        f"{'' if baseline is None else f' (baseline {baseline} MiB)'}"
+        f"{f'; {POOL} lease released' if arbitrated else ''}")
+    return RC_OK
+
+
+def live_port(live: dict | None) -> int:
+    return (live or {}).get("port") or PORT
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    live = read_state()
+    used = read_gpu_used_mib_quick()
+    used_txt = "unreadable" if used is None else f"{used} MiB"
+    port = live_port(live)
+    if not live:
+        say(f"not running under this launcher; port {port} "
+            f"{'IS' if port_in_use(port) else 'is not'} in use; "
+            f"VRAM in use {used_txt}")
+        return RC_FAIL
+    if state_phase(live) == "starting":
+        alive = pid_alive(live.get("wrapper_pid"), live.get("wrapper_start_ticks"))
+        say(f"{'STARTING' if alive else 'STALE STATE (start died)'}: "
+            f"{live.get('model')} on {HOST}:{port}, wrapper pid "
+            f"{live.get('wrapper_pid')}, requested at {live.get('started_at')}, "
+            f"{'arbitrated — may be queued for the ' + POOL + ' lease' if live.get('arbitrated') else 'UNCLAIMED'}, "
+            f"VRAM in use {used_txt}, "
+            f"/health {'ok' if server_ready_once(port) else 'not answering yet'}")
+        return RC_OK if alive else RC_FAIL
+    running = pid_alive(live.get("supervisor_pid"),
+                        live.get("supervisor_start_ticks"))
+    # Named precisely, because "the chat is down" has two very different causes
+    # once a proxy is in the path and they need different fixes.
+    proxy_pid = live.get("proxy_pid")
+    if proxy_pid:
+        alive = pid_alive(proxy_pid)
+        serving = uds_in_use(Path(live["uds"])) if live.get("uds") else False
+        route = (f"proxy {proxy_pid} {'alive' if alive else 'DEAD'} "
+                 f"({live.get('host')}:{port} -> {live.get('uds')}, engine "
+                 f"socket {'answering' if serving else 'NOT answering'}), ")
+    else:
+        route = "direct TCP (no proxy), "
+    say(f"{'running' if running else 'STALE STATE (supervisor gone)'}: "
+        f"{live.get('model')} on {live.get('host')}:{live.get('port')}, "
+        f"{route}"
+        f"supervisor {live.get('supervisor_pid')}, vllm {live.get('vllm_pid')} "
+        f"(group {live.get('vllm_pgid')}), serving since "
+        f"{live.get('started_at')} (up "
+        f"{format_duration(pid_elapsed_seconds(live.get('vllm_pid')))}), "
+        f"{'arbitrated' if live.get('arbitrated') else 'UNCLAIMED'}, "
+        f"VRAM in use {used_txt} (baseline {live.get('vram_baseline_mib')} MiB), "
+        f"/health {'ok' if server_ready_once(port) else 'not answering'}")
+    return RC_OK if running else RC_FAIL
+
+
+def cmd_models(_args: argparse.Namespace) -> int:
+    """List the register and validate each profile — path resolves,
+    `config.json` parses — WITHOUT loading it: no ARM, no vLLM, no GPU.
+
+    So a bad path (like the abliterated profile's `/mnt/wsl/models-z/...`
+    symlink, unproven from that location until this launcher actually loads
+    it) surfaces here, cheaply, rather than five minutes into a cold start.
+    """
+    register = load_register()
+    profiles, default, known_good = (register["PROFILES"],
+                                     register["DEFAULT_PROFILE"],
+                                     register["KNOWN_GOOD_PROFILE"])
+    ok = True
+    for name in sorted(profiles):
+        profile = profiles[name]
+        path = Path(profile["path"])
+        tags = []
+        if name == default:
+            tags.append("default")
+        if name == known_good:
+            tags.append("known-good")
+        tag = f" [{', '.join(tags)}]" if tags else ""
+        if not path.is_dir():
+            ok = False
+            say(f"{name}{tag}: INVALID — {path} does not exist")
+            continue
+        try:
+            with open(path / "config.json") as handle:
+                json.load(handle)
+        except (OSError, ValueError) as exc:
+            ok = False
+            say(f"{name}{tag}: INVALID — {path}/config.json: {exc}")
+            continue
+        say(f"{name}{tag}: {path} — max_model_len {profile['max_model_len']}, "
+            f"kv_cache_memory_bytes {profile['kv_cache_memory_bytes']}")
+        purpose = profile.get("purpose")
+        if purpose:
+            say(f"    {purpose}")
+    if default not in profiles:
+        ok = False
+        say(f"DEFAULT_PROFILE {default!r} is not in PROFILES")
+    if known_good not in profiles:
+        ok = False
+        say(f"KNOWN_GOOD_PROFILE {known_good!r} is not in PROFILES")
+    return RC_OK if ok else RC_FAIL
+
+
+# --------------------------------------------------------------------------
+# selftest — asserts the question this launcher asks ARM, not ARM's answer
+# --------------------------------------------------------------------------
+
+RECORDING_ARM = """#!{python}
+import json, os, sys
+with open(os.environ["DSH_SERVE_ARGV_LOG"], "a") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:2] == ["--help"]:
+    sys.exit(0)
+if sys.argv[1:2] == ["check"]:
+    # Real `arm check --json` output, nesting and all. One live holder and one
+    # queued claim, because those two render differently and must not be mixed.
+    print(json.dumps({{"decision": {{
+        "outcome": "would_block", "code": "busy",
+        "reason": "pool 'gpu0' is busy: gpu0-studio-ab4b0b (studio, interactive)",
+        "blockers": ["gpu0-studio-ab4b0b", "gpu0-trainer-fa2424"],
+        "blockers_detail": [
+            {{"id": "gpu0-studio-ab4b0b", "kind": "lease", "app": "studio",
+             "prio": "interactive", "purpose": "a MiniMax-H3 render"}},
+            {{"id": "gpu0-trainer-fa2424", "kind": "waiter", "app": "trainer",
+             "prio": "batch", "purpose": "H3 768px 6000-step"}}]}}}}))
+    sys.exit(3)
+sys.exit(int(os.environ.get("DSH_SERVE_FAKE_ARM_RC", "0")))
+"""
+
+# Backed by a file so a case can move the reading between the baseline and the
+# teardown — which is the whole situation worth testing.
+# Builtins only: the sandbox PATH holds the doubles and nothing else, so this
+# cannot reach `cat`.
+FAKE_SMI = """#!/bin/sh
+if [ -n "$DSH_SERVE_FAKE_MIB_FILE" ] && [ -f "$DSH_SERVE_FAKE_MIB_FILE" ]; then
+    read mib < "$DSH_SERVE_FAKE_MIB_FILE"
+    echo "$mib"
+else
+    echo "${DSH_SERVE_FAKE_MIB:-0}"
+fi
+"""
+
+
+class Failure(Exception):
+    pass
+
+
+def check(condition: bool, description: str) -> None:
+    if not condition:
+        raise Failure(description)
+
+
+def sandbox(tmp: Path, *, books: bool, arm: bool, smi_mib: str | None = None):
+    """A throwaway HOME plus a PATH holding only the doubles this case needs
+    (plus the real `git`, for the model register — see below).
+
+    HOME is what isolates it: every path this script uses — the books, the state
+    file, the log — is derived from it.
+    """
+    home = tmp / "home"
+    (home / ".local" / "state").mkdir(parents=True, exist_ok=True)
+    if books:
+        (home / ".aivan_arm").mkdir(parents=True, exist_ok=True)
+        (home / ".aivan_arm" / "config.json").write_text('{"consumers": {}}\n')
+    bindir = tmp / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    if arm:
+        double = bindir / "arm"
+        # An absolute interpreter, so PATH can hold the doubles and nothing
+        # else — a real `arm` or a real `nvidia-smi` leaking in would make
+        # these cases assert against the box instead of against the launcher.
+        double.write_text(RECORDING_ARM.format(python=sys.executable))
+        double.chmod(0o755)
+    if smi_mib is not None:
+        double = bindir / "nvidia-smi"
+        double.write_text(FAKE_SMI)
+        double.chmod(0o755)
+    # `load_register` shells out to the real `git`, deliberately not a
+    # double: the register is real committed content on REGISTER_BRANCH, not
+    # a behavior this launcher owns and fakes for a test. Every case that
+    # spawns a child through `start`/`try-vision` needs it on PATH, so it is
+    # here rather than opted in per case.
+    path = str(bindir)
+    git_bin = shutil.which("git")
+    if git_bin:
+        path = f"{path}:{Path(git_bin).parent}"
+    env = {**os.environ, "HOME": str(home), "PATH": path,
+           "DSH_SERVE_ARGV_LOG": str(tmp / "argv.log")}
+    if smi_mib is not None:
+        env["DSH_SERVE_FAKE_MIB"] = smi_mib
+    return env, home
+
+
+def run_self(env: dict, *argv: str, timeout: float = 120) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, os.path.abspath(__file__), *argv],
+                          capture_output=True, text=True, env=env, timeout=timeout)
+
+
+def free_port() -> str:
+    """A port nothing is on, so a case never collides with the live server —
+    which is exactly what `start`'s own port guard is there to protect."""
+    with socket.socket() as probe:
+        probe.bind((HOST, 0))
+        return str(probe.getsockname()[1])
+
+
+def case_argv(tmp: Path) -> None:
+    """The recorded claim IS the assertion: pool, app, exclusivity and class are
+    the question this launcher puts to ARM, independent of any answer."""
+    env, _ = sandbox(tmp, books=True, arm=True)
+    port = free_port()
+    out = run_self(env, "start", "--vllm-bin", "/bin/true", "--port", port,
+                   "--ready-timeout", "20")
+    recorded = [json.loads(line) for line in
+                (tmp / "argv.log").read_text().splitlines()]
+    claims = [one for one in recorded if one[:2] == ["run", POOL]]
+    check(len(claims) == 1, f"expected exactly one `arm run {POOL}`, got {recorded}")
+    argv = claims[0]
+    check(argv[argv.index("--app") + 1] == APP, f"--app is not {APP}: {argv}")
+    check("--exclusive" in argv, f"claim is not exclusive: {argv}")
+    check("--vram" not in argv and "--gb" not in argv,
+          f"metered claim on {POOL} is forbidden: {argv}")
+    check(argv[argv.index("--prio") + 1] == REGISTERED_PRIO,
+          f"--prio is not {REGISTERED_PRIO}: {argv}")
+    purpose = argv[argv.index("--purpose") + 1]
+    check(SERVED_MODEL_NAME in purpose and port in purpose,
+          f"--purpose names neither the model nor the port: {purpose!r}")
+    check("--" in argv and argv[argv.index("--") + 1] != "vllm",
+          "vllm must not be arm run's direct child; the supervisor must be")
+    check(any("_supervise" in one for one in argv),
+          f"the supervisor is not the wrapped child: {argv}")
+    check(out.returncode != RC_OK,
+          "start reported success although the double never served anything")
+
+
+def case_prio_override_needs_reason(tmp: Path) -> None:
+    """The TD's ruling, enforced: upward from `fleet` requires a stated why."""
+    env, _ = sandbox(tmp, books=True, arm=True)
+    out = run_self(env, "start", "--prio", "service", "--vllm-bin", "/bin/true",
+                   "--port", free_port())
+    check(out.returncode == RC_FAIL, f"expected refusal, got rc {out.returncode}")
+    check("--purpose" in out.stderr, f"refusal does not say why: {out.stderr!r}")
+    check(not (tmp / "argv.log").exists(),
+          "refused, yet it still put a claim to ARM")
+
+
+def case_would_block_names_who(tmp: Path) -> None:
+    """A refusal that says only "GPU busy" sends the operator off to run
+    `arm status`. Name the holder — from `blockers_detail` values, never by
+    parsing `reason`, whose wording is not a contract."""
+    env, _ = sandbox(tmp, books=True, arm=True)
+    env["DSH_SERVE_FAKE_ARM_RC"] = "98"
+    out = run_self(env, "start", "--vllm-bin", "/bin/true", "--port", free_port(),
+                   "--ready-timeout", "20")
+    check(out.returncode == RC_WOULD_BLOCK,
+          f"expected rc {RC_WOULD_BLOCK}, got {out.returncode}: {out.stderr!r}")
+    check("held by studio" in out.stderr,
+          f"a live holder must read as 'held by': {out.stderr!r}")
+    check("MiniMax-H3 render" in out.stderr,
+          f"the holder's purpose is what makes it actionable: {out.stderr!r}")
+    # A waiter means the pool may be entirely free and we are standing aside for
+    # a queued claim; calling that "held by" would be a lie.
+    check("queued behind trainer" in out.stderr,
+          f"a waiter must not read as a holder: {out.stderr!r}")
+
+
+def case_books_present_arm_missing(tmp: Path) -> None:
+    """The bottom row of the consumer brief's §4c table: the books say this box
+    is arbitrated, so an unreachable `arm` is a refusal, never permission."""
+    env, _ = sandbox(tmp, books=True, arm=False)
+    out = run_self(env, "start", "--vllm-bin", "/bin/true", "--port", free_port())
+    check(out.returncode == RC_ARM_ERROR,
+          f"expected rc {RC_ARM_ERROR}, got {out.returncode}: {out.stderr!r}")
+    check("arbitrated" in out.stderr, f"refusal is not loud: {out.stderr!r}")
+
+
+def case_books_absent_runs_unclaimed(tmp: Path) -> None:
+    """The top row: no books, no arbiter — a fresh clone, CI, Runpod."""
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    out = run_self(env, "start", "--vllm-bin", "/bin/true", "--port", free_port(),
+                   "--ready-timeout", "20")
+    check("UNCLAIMED" in out.stderr, f"did not announce it: {out.stderr!r}")
+    check(not (tmp / "argv.log").exists(), "claimed on a box with no arbiter")
+    log = (home / ".local" / "state" / "dsh-serve" / "server.log").read_text()
+    check("VRAM baseline before launch: 0 MiB" in log,
+          f"supervisor did not take a baseline: {log!r}")
+
+
+def case_stop_requires_vram_return(tmp: Path) -> None:
+    """`stop` must not print "stopped" over a card that is still full."""
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="26000")
+    state = home / ".local" / "state" / "dsh-serve"
+    state.mkdir(parents=True, exist_ok=True)
+    # A stand-in supervisor that dies on the SIGTERM `stop` sends, leaving the
+    # card reading 26000 MiB against an 800 MiB baseline: the exact defect —
+    # the process is gone and the VRAM is not back.
+    stand_in = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        (state / "state.json").write_text(json.dumps({
+            "wrapper_pid": stand_in.pid,
+            "wrapper_start_ticks": pid_start_ticks(stand_in.pid),
+            "supervisor_pid": stand_in.pid,
+            "supervisor_start_ticks": pid_start_ticks(stand_in.pid),
+            "vllm_pid": stand_in.pid, "vllm_pgid": stand_in.pid,
+            "vram_baseline_mib": 800, "arbitrated": False,
+            "host": HOST, "port": int(free_port()), "model": SERVED_MODEL_NAME,
+        }))
+        out = run_self(env, "stop", "--timeout", "20")
+        check(not pid_alive(stand_in.pid), "stop did not signal the recorded pid")
+        check(out.returncode == RC_VRAM_HELD,
+              f"expected rc {RC_VRAM_HELD}, got {out.returncode}: {out.stderr!r}")
+        check("stopped;" not in out.stderr,
+              f"said stopped over a full card: {out.stderr!r}")
+        check("NOT CONFIRMED" in out.stderr, f"not loud enough: {out.stderr!r}")
+    finally:
+        if stand_in.poll() is None:
+            stand_in.kill()
+        stand_in.wait()
+
+
+def case_refuses_to_release(tmp: Path) -> None:
+    """⛔ The requirement that carries the most weight.
+
+    The child exits, the recorded group is empty, and the card is STILL full —
+    the exact shape of a surviving `VLLM::EngineCore`. Under a lease the
+    supervisor must not exit, because its exit is what releases the lease.
+    """
+    env, home = sandbox(tmp, books=True, arm=True, smi_mib="0")
+    reading = tmp / "vram.txt"
+    reading.write_text("0\n")                       # the pre-launch baseline
+    env["DSH_SERVE_FAKE_MIB_FILE"] = str(reading)
+    # A stand-in "vllm" that leaves the card full behind it and exits.
+    leaky = tmp / "leaky-vllm"
+    leaky.write_text(f'#!/bin/sh\necho 26000 > "{reading}"\nexit 0\n')
+    leaky.chmod(0o755)
+
+    supervisor = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_supervise",
+         "--vllm-bin", str(leaky), "--arbitrated", "--vram-timeout", "3",
+         "--port", free_port()],
+        stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, env=env)
+    try:
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline and supervisor.poll() is None:
+            time.sleep(0.25)
+        check(supervisor.poll() is None,
+              f"the supervisor EXITED (rc {supervisor.returncode}) over a full "
+              "card — the lease would have been released")
+        supervisor.terminate()
+        try:
+            supervisor.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            supervisor.kill()
+            supervisor.wait()
+        log = (home / ".local" / "state" / "dsh-serve" / "server.log")
+        text = log.read_text() if log.exists() else (supervisor.stderr.read() or "")
+    finally:
+        if supervisor.poll() is None:
+            supervisor.kill()
+            supervisor.wait()
+    check("REFUSING TO RELEASE" in text, f"held, but said nothing: {text!r}")
+    check("26000" in text, f"the refusal does not state what it saw: {text!r}")
+
+
+def write_fake_state(home: Path, payload: dict) -> Path:
+    where = home / ".local" / "state" / "dsh-serve" / "state.json"
+    where.parent.mkdir(parents=True, exist_ok=True)
+    where.write_text(json.dumps(payload, indent=2) + "\n")
+    return where
+
+
+def case_stop_mid_start(tmp: Path) -> None:
+    """⛔ `stop` must reach a start that has not produced a server yet.
+
+    Until 2026-08-27 nothing was recorded between `start` spawning the wrapper
+    and the supervisor's own record minutes later, so a `stop` in that window
+    found no state, said "nothing is running" and exited 0 — while the start
+    went on to take the card unattended. The window is unbounded when the ARM
+    claim is queued. A machine caller can hit it on any stop at the seam.
+    """
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    victim = subprocess.Popen(["sleep", "120"], start_new_session=True,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+    try:
+        state = write_fake_state(home, {
+            "phase": "starting",
+            "wrapper_pid": victim.pid,
+            "wrapper_start_ticks": pid_start_ticks(victim.pid),
+            "arbitrated": False, "host": HOST, "port": int(free_port()),
+            "uds": None, "model": SERVED_MODEL_NAME, "serve_args": [],
+            "started_at": "2026-08-27T00:00:00+0300",
+        })
+        out = run_self(env, "stop", "--timeout", "30")
+        check(out.returncode == RC_OK,
+              f"expected rc {RC_OK}, got {out.returncode}: {out.stderr!r}")
+        check(victim.poll() is not None or not pid_alive(victim.pid),
+              "the in-flight start was left running — this is the orphaned-card "
+              "bug the early record exists to close")
+        check(not state.exists(), "the starting record was left behind")
+    finally:
+        if victim.poll() is None:
+            victim.kill()
+        victim.wait()
+
+
+def case_already_running(tmp: Path) -> None:
+    """`start` distinguishes "already up" from "failed", and `--if-not-running`
+    accepts ONLY the configuration it asked for."""
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    holder = subprocess.Popen(["sleep", "120"], start_new_session=True,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+    try:
+        port = free_port()
+        # The child resolves the default profile's path under the sandbox
+        # HOME; this process resolved it under the real one. Same list,
+        # different root.
+        _, default_profile = resolve_profile(None)
+        sandboxed = [one.replace(str(default_profile["path"]),
+                                 str(home / "models" / default_profile["path"].name))
+                     for one in vllm_args(default_profile, int(port))]
+        record = {
+            "phase": "serving",
+            "supervisor_pid": holder.pid,
+            "supervisor_start_ticks": pid_start_ticks(holder.pid),
+            "wrapper_pid": holder.pid,
+            "wrapper_start_ticks": pid_start_ticks(holder.pid),
+            "vllm_pid": holder.pid, "vllm_pgid": holder.pid,
+            "arbitrated": False, "host": HOST, "port": int(port), "uds": None,
+            "model": SERVED_MODEL_NAME, "vram_baseline_mib": 0,
+            "serve_args": sandboxed,
+            "started_at": "2026-08-27T00:00:00+0300",
+        }
+        write_fake_state(home, record)
+        # --no-uds pinned explicitly on every call below: the fake "already
+        # running" record was built from `vllm_args()` with no `uds`
+        # argument, i.e. direct-TCP args. This case is about the
+        # already-running/config-mismatch decision, not about transport, so
+        # it must not ride whatever `start`'s own uds default happens to be
+        # — that already broke it once, 2026-09-04, when the default flipped.
+        out = run_self(env, "start", "--port", port, "--vllm-bin", "/bin/true",
+                       "--no-uds")
+        check(out.returncode == RC_ALREADY_RUNNING,
+              f"expected rc {RC_ALREADY_RUNNING}, got {out.returncode}")
+
+        out = run_self(env, "start", "--if-not-running", "--port", port,
+                       "--vllm-bin", "/bin/true", "--no-uds")
+        check(out.returncode == RC_OK,
+              f"a matching configuration must be accepted: rc {out.returncode}"
+              f": {out.stderr!r}")
+
+        record["serve_args"] = [*sandboxed, "--no-language-model-only"]
+        write_fake_state(home, record)
+        out = run_self(env, "start", "--if-not-running", "--port", port,
+                       "--vllm-bin", "/bin/true", "--no-uds")
+        check(out.returncode == RC_CONFIG_MISMATCH,
+              f"a DIFFERENT configuration must fail loudly, got rc "
+              f"{out.returncode} — accepting it would hand the caller a server "
+              "it did not ask for")
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait()
+
+
+def case_json_payload(tmp: Path) -> None:
+    """`--json` is the machine-readable surface: one object on stdout, prose
+    untouched on stderr, and an object on the refusal paths too."""
+    env, _ = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    out = run_self(env, "status", "--json")
+    payload = json.loads(out.stdout)
+    check(payload["schema_version"] == JSON_SCHEMA_VERSION,
+          f"unversioned payload: {payload!r}")
+    # A consumer distinguishes an ABSENT key (an older launcher — warn and
+    # proceed) from an explicit null (known-unknown), so every key ships on
+    # every call whatever its value.
+    for key in ("running", "healthy", "vision", "model_served",
+                "model_requested", "profile", "phase", "endpoint"):
+        check(key in payload, f"{key} missing — absence means 'older launcher' "
+                              f"to a consumer: {payload!r}")
+    check(payload["running"] is False and payload["rc"] == RC_FAIL,
+          f"a launcher with no state is not running: {payload!r}")
+    check(out.stderr.startswith("dsh-serve: "),
+          f"the prose left stderr: {out.stderr!r}")
+    check("\n" not in out.stdout.strip(),
+          f"stdout must be exactly one object: {out.stdout!r}")
+
+
+def case_status_never_wedges(tmp: Path) -> None:
+    """⛔ A read-only verb answers, whatever `nvidia-smi` is doing.
+
+    Reported by studio3 2026-08-27 as `status --json` never returning: they
+    killed it at 20 s, which is exactly this launcher's `nvidia-smi` timeout,
+    and `status --json` read the card TWICE. A stalled binary could hold a
+    read-only verb for 40 s before it said anything, and a machine consumer
+    that times out first gets nothing to classify at all.
+
+    The refusal is typed, not silent: `vram_used_mib` is null and the prose
+    says `unreadable`. None is UNKNOWN and never zero.
+    """
+    env, _ = sandbox(tmp, books=False, arm=False)
+    stalled = tmp / "bin" / "nvidia-smi"
+    # An ABSOLUTE interpreter and no PATH lookup inside: the sandbox's PATH
+    # holds only its own doubles, so a `#!/bin/sh` stub calling `sleep` exits
+    # 127 at once and the case passes while stalling nothing. That is the
+    # green-and-proving-nothing shape this very case exists to catch.
+    stalled.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(120)\n")
+    stalled.chmod(0o755)
+
+    began = time.monotonic()
+    out = run_self(env, "status", "--json", timeout=60)
+    took = time.monotonic() - began
+    check(took < SMI_QUICK_TIMEOUT_S + 5,
+          f"status --json took {took:.1f}s against a stalled nvidia-smi — a "
+          "consumer cannot wait that long for a read-only verb")
+    payload = json.loads(out.stdout)
+    check(payload["elapsed_seconds"] <= took,
+          f"elapsed_seconds {payload['elapsed_seconds']} exceeds the wall time "
+          f"{took:.1f}s this verb actually took")
+    check(payload["vram_used_mib"] is None,
+          f"an unreadable card must be null, never a number: {payload!r}")
+    check("unreadable" in out.stderr,
+          f"the prose must say it could not read the card: {out.stderr!r}")
+
+
+def _reap_state_pids(home: Path) -> None:
+    """Kill whatever a case left running, by the PIDs recorded in state.json —
+    never by pattern. Shared by cases whose whole point is a server that is
+    still up when the verb under test returns (a wedge deliberately left for a
+    human, or here, a deliberately-mute double left for this case to clean up)."""
+    state = home / ".local" / "state" / "dsh-serve" / "state.json"
+    if not state.exists():
+        return
+    live = json.loads(state.read_text())
+    for pid in (live.get("vllm_pgid"), live.get("supervisor_pid"),
+               live.get("proxy_pid")):
+        if not pid:
+            continue
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+
+def case_unreachable_warning_fires(tmp: Path) -> None:
+    """The early warning (`DIRECT_TCP_UNREACHABLE_WARN_S`) must actually fire,
+    exactly once, on stderr AND in `server.log`, before the full
+    `--ready-timeout` — on a direct-TCP start that never becomes healthy.
+
+    Real time, deliberately: the threshold is an absolute duration measured
+    from real launches, not a fraction of whatever `--ready-timeout` the
+    caller configures, so faking a shorter threshold here would test a
+    different number than production runs on. `--ready-timeout` is set just
+    above the real constant so the case waits only as long as proving this
+    honestly requires.
+    """
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    mute = tmp / "mute-vllm"
+    mute.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(180)\n")
+    mute.chmod(0o755)
+    ready_timeout = DIRECT_TCP_UNREACHABLE_WARN_S + 10
+    try:
+        # --no-uds pinned explicitly: `start`'s own default flipped to `uds`
+        # 2026-09-04, and this case's whole point is the direct-TCP path —
+        # riding the default would make it silently test the wrong transport
+        # the next time that default moves (it already did once).
+        out = run_self(env, "start", "--vllm-bin", str(mute),
+                       "--port", free_port(), "--no-uds",
+                       "--ready-timeout", str(ready_timeout),
+                       timeout=int(ready_timeout) + 30)
+        check(out.returncode == RC_READY_TIMEOUT,
+              f"expected rc {RC_READY_TIMEOUT}, got {out.returncode}: "
+              f"{out.stderr!r}")
+        check("very likely wedged" in out.stderr,
+              f"the early warning never printed on stderr: {out.stderr!r}")
+        check(out.stderr.count("very likely wedged") == 1,
+              f"the warning must fire once, not spam: {out.stderr!r}")
+        log = (home / ".local" / "state" / "dsh-serve" / "server.log").read_text()
+        check("very likely wedged" in log,
+              "the warning must also land in server.log, for whoever is not "
+              f"watching this terminal live: {log[-800:]!r}")
+    finally:
+        _reap_state_pids(home)
+
+
+def case_unreachable_warning_uds_silent(tmp: Path) -> None:
+    """The early warning must NEVER fire on `--uds` — 13/13 in this box's
+    own history never needed it, and warning on the arm that never fails
+    would teach a human to ignore the warning that does matter. Same
+    duration as `unreachable-warning-fires`, on purpose: this proves silence
+    past the threshold, not merely silence before it."""
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    mute = tmp / "mute-vllm"
+    mute.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(180)\n")
+    mute.chmod(0o755)
+    ready_timeout = DIRECT_TCP_UNREACHABLE_WARN_S + 10
+    try:
+        out = run_self(env, "start", "--vllm-bin", str(mute), "--uds",
+                       "--port", free_port(),
+                       "--ready-timeout", str(ready_timeout),
+                       timeout=int(ready_timeout) + 30)
+        check(out.returncode == RC_READY_TIMEOUT,
+              f"expected rc {RC_READY_TIMEOUT}, got {out.returncode}: "
+              f"{out.stderr!r}")
+        check("very likely wedged" not in out.stderr,
+              f"the direct-TCP warning must not fire on --uds: {out.stderr!r}")
+        log = (home / ".local" / "state" / "dsh-serve" / "server.log").read_text()
+        check("very likely wedged" not in log,
+              f"the direct-TCP warning leaked into the log on --uds: "
+              f"{log[-800:]!r}")
+    finally:
+        _reap_state_pids(home)
+
+
+# A real HTTP double whose /health answer is controlled by a file the test
+# flips live, and which logs every hit it receives with a timestamp — so the
+# two cases below synchronize on OBSERVED probes, never on assumed timing.
+# `cmd_supervise`'s own probe schedule (30s apart, first one immediate) is
+# real and unmocked here, same reasoning as the direct-TCP warning cases:
+# faking the interval would test a different schedule than production runs.
+MID_SESSION_HEALTH_DOUBLE = '''#!{python}
+import http.server, os, sys, time
+
+port = int(sys.argv[sys.argv.index("--port") + 1])
+flag = os.environ["DSH_SERVE_TEST_HEALTH_FLAG"]
+hits = os.environ["DSH_SERVE_TEST_HEALTH_HITS"]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            up = open(flag).read().strip() != "down"
+        except OSError:
+            up = True
+        with open(hits, "a") as f:
+            f.write(f"{{time.time()}} {{'up' if up else 'down'}}\\n")
+        self.send_response(200 if up else 503)
+        self.end_headers()
+        if up:
+            self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass
+
+http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+'''
+
+
+def _wait_for_hit_count(hits_path: Path, n: int, timeout: float) -> list[str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if hits_path.exists():
+            lines = hits_path.read_text().splitlines()
+            if len(lines) >= n:
+                return lines
+        time.sleep(0.5)
+    got = hits_path.read_text().splitlines() if hits_path.exists() else []
+    raise Failure(f"timed out waiting for {n} /health hits; got {len(got)}: {got}")
+
+
+def _mid_session_double(tmp: Path, flag: Path, hits: Path) -> Path:
+    flag.write_text("up")
+    double = tmp / "toggle-vllm"
+    double.write_text(MID_SESSION_HEALTH_DOUBLE.format(python=sys.executable))
+    double.chmod(0o755)
+    return double
+
+
+def case_mid_session_capture_fires(tmp: Path) -> None:
+    """The mid-session watchdog (`MID_SESSION_PROBE_INTERVAL_S` /
+    `MID_SESSION_MISS_THRESHOLD`, TD-approved 2026-09-04 as tier 1 of the
+    forensic-gap pricing) must capture evidence once a server that was
+    healthy stops answering — the gap the startup-only capture never covered.
+
+    Synchronizes on the double's own hit log, not on assumed timing: the real
+    30s-apart schedule is what production runs, so this waits for OBSERVED
+    probes rather than sleeping a guessed duration.
+    """
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    flag, hits = tmp / "health-flag", tmp / "health-hits"
+    double = _mid_session_double(tmp, flag, hits)
+    env["DSH_SERVE_TEST_HEALTH_FLAG"] = str(flag)
+    env["DSH_SERVE_TEST_HEALTH_HITS"] = str(hits)
+    try:
+        out = run_self(env, "start", "--vllm-bin", str(double), "--no-uds",
+                       "--port", free_port(), "--ready-timeout", "20")
+        check(out.returncode == RC_OK,
+              f"the double should have come up clean: rc {out.returncode}: "
+              f"{out.stderr!r}")
+        baseline = len(_wait_for_hit_count(hits, 1, timeout=10))
+        flag.write_text("down")
+        # Two NEW misses since the flip — the threshold — must produce a
+        # capture; wait past a comfortable margin beyond two real intervals.
+        lines = _wait_for_hit_count(hits, baseline + 2, timeout=90)
+        check(lines[-1].endswith("down") and lines[-2].endswith("down"),
+              f"expected the two hits after the flip to see 'down': {lines!r}")
+        deadline = time.monotonic() + 15
+        log_text = ""
+        while time.monotonic() < deadline:
+            log_text = (home / ".local" / "state" / "dsh-serve"
+                       / "server.log").read_text()
+            if "mid-session" in log_text:
+                break
+            time.sleep(0.5)
+        check("mid-session" in log_text,
+              f"the mid-session capture warning never printed: {log_text[-800:]!r}")
+        captures = sorted((home / ".local" / "state" / "dsh-serve"
+                           / "unreachable").glob("unreachable-*.txt"))
+        check(captures, "the miss threshold was crossed without a capture file")
+        check("mid-session" in captures[-1].read_text(),
+              f"the capture's own note does not say mid-session: "
+              f"{captures[-1].read_text()[:400]!r}")
+    finally:
+        _reap_state_pids(home)
+
+
+def case_mid_session_capture_silent_on_one_miss(tmp: Path) -> None:
+    """A single miss must NOT capture — only `MID_SESSION_MISS_THRESHOLD`
+    consecutive ones. Flips back to 'up' the instant exactly one down-hit is
+    observed, then confirms two more real probes pass with no capture."""
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    flag, hits = tmp / "health-flag", tmp / "health-hits"
+    double = _mid_session_double(tmp, flag, hits)
+    env["DSH_SERVE_TEST_HEALTH_FLAG"] = str(flag)
+    env["DSH_SERVE_TEST_HEALTH_HITS"] = str(hits)
+    try:
+        out = run_self(env, "start", "--vllm-bin", str(double), "--no-uds",
+                       "--port", free_port(), "--ready-timeout", "20")
+        check(out.returncode == RC_OK,
+              f"the double should have come up clean: rc {out.returncode}: "
+              f"{out.stderr!r}")
+        baseline = len(_wait_for_hit_count(hits, 1, timeout=10))
+        flag.write_text("down")
+        lines = _wait_for_hit_count(hits, baseline + 1, timeout=45)
+        check(lines[-1].endswith("down"),
+              f"expected the hit after the flip to see 'down': {lines!r}")
+        flag.write_text("up")  # recover before a second miss can register
+        # Two more REAL probes must pass with the counter reset — not just
+        # "no capture yet", which a too-short wait could pass by accident.
+        lines = _wait_for_hit_count(hits, baseline + 3, timeout=90)
+        check(lines[-1].endswith("up") and lines[-2].endswith("up"),
+              f"expected recovery to hold: {lines!r}")
+        log_text = (home / ".local" / "state" / "dsh-serve"
+                   / "server.log").read_text()
+        check("mid-session" not in log_text,
+              f"a single recovered miss must not capture: {log_text[-800:]!r}")
+        captures = list((home / ".local" / "state" / "dsh-serve"
+                        / "unreachable").glob("unreachable-*.txt"))
+        check(not captures,
+              f"a single recovered miss wrote a capture anyway: {captures!r}")
+    finally:
+        _reap_state_pids(home)
+
+
+def case_doc_example(_tmp: Path) -> None:
+    """The consumed-surface doc's `--json` example must name the real fields.
+
+    A drift-detection test, not a source of truth: the launcher is authoritative
+    and the doc is a copy, so this asserts they agree without importing one into
+    the other. It exists because the copy DID drift and a consumer built eight
+    fakes from it — all agreeing with each other, all green, all wrong. Fakes
+    written from the same reading as the code under test prove self-consistency
+    and nothing else; only a comparison against the real payload catches this.
+    """
+    if not CONSUMER_DOC.exists():
+        say(f"no {CONSUMER_DOC} on this box — nothing to compare against; the "
+            "launcher remains authoritative either way")
+        return
+    text = CONSUMER_DOC.read_text()
+    start = text.find("```json")
+    end = text.find("```", start + 7)
+    check(start != -1 and end != -1, f"no ```json example in {CONSUMER_DOC}")
+    example = json.loads(text[start + 7:end])
+    real = json_payload(RC_OK)
+    missing = sorted(set(real) - set(example))
+    invented = sorted(set(example) - set(real))
+    check(not missing and not invented,
+          f"{CONSUMER_DOC} §4 disagrees with the payload — "
+          f"absent from the doc: {missing}; named by the doc but not emitted: "
+          f"{invented}")
+
+
+def case_kv_pool_coherence(tmp: Path) -> None:
+    """The window and the KV pool are one decision, asserted in both directions.
+
+    `--kv-cache-memory-bytes` makes vLLM skip memory profiling, so a pool that
+    cannot hold one max-length request is not a tight fit — it is a ValueError a
+    minute into startup with the GPU already claimed. Found 2026-08-24, when
+    raising the window alone would have done exactly that to a live server.
+    """
+    env, home = sandbox(tmp, books=True, arm=True)
+    _, default_profile = resolve_profile(None)
+    # This checkpoint's real geometry: 64 layers, every 4th full-attention.
+    model = home / "models" / default_profile["path"].name
+    model.mkdir(parents=True, exist_ok=True)
+    (model / "config.json").write_text(json.dumps({
+        "num_hidden_layers": 64,
+        "full_attention_interval": 4,
+        "layer_types": ["full_attention" if (one % 4) == 3 else "linear_attention"
+                        for one in range(64)],
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+    }))
+    argv_log = tmp / "argv.log"
+
+    # The shipped pair must PASS — a guard that refuses the production config
+    # is worse than no guard, so this direction is asserted first.
+    out = run_self(env, "start", "--vllm-bin", "/bin/true", "--port", free_port(),
+                   "--ready-timeout", "20")
+    check(argv_log.exists(),
+          f"the shipped window/pool pair was refused by its own guard: {out.stderr!r}")
+    served = [one for one in (json.loads(line) for line in
+                              argv_log.read_text().splitlines())
+              if one[:2] == ["run", POOL]][0]
+    check(last_flag_value(served, "--max-model-len") == str(default_profile["max_model_len"]),
+          f"--max-model-len is not {default_profile['max_model_len']}: {served}")
+    check(last_flag_value(served, "--kv-cache-memory-bytes") ==
+          str(default_profile["kv_cache_memory_bytes"]),
+          f"--kv-cache-memory-bytes is not "
+          f"{default_profile['kv_cache_memory_bytes']}: {served}")
+
+    # ...and the pair that would have crashed the engine must be refused before
+    # the claim. A trailing override is the shape an operator would reach for.
+    argv_log.unlink()
+    out = run_self(env, "start", "--vllm-bin", "/bin/true", "--port", free_port(),
+                   "--ready-timeout", "20", "--",
+                   "--max-model-len", "131072",
+                   "--kv-cache-memory-bytes", "2147483648")
+    check(out.returncode == RC_FAIL,
+          f"expected rc {RC_FAIL}, got {out.returncode}: {out.stderr!r}")
+    check(not argv_log.exists(),
+          "an incoherent pair still took the GPU claim to ARM")
+    check("131072" in out.stderr and "2147483648" in out.stderr,
+          f"the refusal names neither number: {out.stderr!r}")
+    # 16 full-attention layers x 4 KV heads x 256 head_dim x (K+V) x 1 byte
+    # x 131072 tokens = 4 GiB, the floor the 2 GiB pool falls under.
+    check(str(131072 * 16 * 4 * 256 * 2) in out.stderr,
+          f"the refusal does not state what the window actually needs: {out.stderr!r}")
+
+
+def case_pgroup(_tmp: Path) -> None:
+    """The measurement the whole design rests on, with a GPU-free stand-in:
+    a wrapper's direct child can exit while its grandchild lives on, and only
+    the recorded process group reaps both."""
+    stand_in = (
+        "import os, sys, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    time.sleep(600)\n"
+        "    os._exit(0)\n"
+        "print(pid, flush=True)\n"
+        "time.sleep(float(sys.argv[1]))\n"
+    )
+
+    def spawn(linger: str):
+        child = subprocess.Popen([sys.executable, "-c", stand_in, linger],
+                                 stdout=subprocess.PIPE, text=True,
+                                 start_new_session=True)
+        return child, int(child.stdout.readline().strip())
+
+    # A: the hazard — `arm run`'s exact wait, returning over a live grandchild.
+    child, grandchild = spawn("0.5")
+    child.wait()
+    check(pid_alive(grandchild),
+          "the stand-in grandchild did not outlive its parent, so this probe "
+          "cannot speak for VLLM::EngineCore")
+    os.killpg(os.getpgid(grandchild), signal.SIGKILL)
+
+    # B: the fix — kill the recorded group before reaping, and it empties.
+    child, grandchild = spawn("600")
+    pgid = os.getpgid(child.pid)
+    check(pgid == child.pid, f"child is not its own group leader: {pgid}")
+    check(grandchild in pgid_members(pgid), "grandchild is outside the group")
+    os.killpg(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and pgid_members(pgid):
+        time.sleep(0.05)
+    left = pgid_members(pgid)
+    child.wait()
+    check(not left, f"killpg left members behind: {left}")
+    check(not pid_alive(grandchild), "killpg did not reach the grandchild")
+
+
+def case_vision_probe_asserts_on_the_answer(tmp: Path) -> None:
+    """⭐ A 200 is not a pass.
+
+    The whole reason `try-vision` exists is that the image path was never proven,
+    so its probe must fail a server that answers cheerfully with the wrong
+    colour. If this case ever goes green on a stub that ignores the image, the
+    verb has stopped testing anything.
+    """
+    # Test-only dependencies, kept out of the module's runtime imports.
+    import http.server
+    import threading
+
+    png = solid_png(8, 8, VISION_PROBE_RGB)
+    check(png.startswith(b"\x89PNG\r\n\x1a\n"), "probe image is not a PNG")
+    for tag in (b"IHDR", b"IDAT", b"IEND"):
+        check(tag in png, f"probe PNG has no {tag.decode()} chunk")
+    body = png[png.index(b"IDAT") + 4:]
+    check(len(zlib.decompress(body[:-12])) == 8 * (8 * 3 + 1),
+          "probe PNG pixel data does not decode to one filter byte per row")
+
+    replies: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            payload = replies.pop(0).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args) -> None:
+            pass
+
+    def reply(content: str) -> str:
+        return json.dumps({"choices": [{"message": {"content": content}}],
+                           "usage": {"prompt_tokens": 90}})
+
+    server = http.server.HTTPServer((HOST, 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        replies.append(reply("blue"))
+        passed, detail = image_probe(port, timeout=20)
+        check(not passed, f"passed a 200 that named the wrong colour: {detail}")
+
+        replies.append(reply(""))
+        passed, detail = image_probe(port, timeout=20)
+        check(not passed, f"passed an empty answer: {detail}")
+
+        # Both directions, so the case can never pass by always refusing.
+        replies.append(reply("Red."))
+        passed, detail = image_probe(port, timeout=20)
+        check(passed, f"failed the right answer: {detail}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
+
+
+def case_vision_captures_then_restores(tmp: Path) -> None:
+    """The guarded start's promise: on a server that comes up and never answers,
+    capture the evidence FIRST, then put the text-only config back.
+
+    The discriminating assertion is on the second claim's argv — a restore that
+    carried the vision flag would be a restore in name only.
+    """
+    # Unarbitrated on purpose: the recording `arm` double exits immediately, so
+    # under it the wrapper is never alive long enough to reach the readiness
+    # TIMEOUT — `start` would leave through its early-exit path instead, and the
+    # capture this case exists to assert would never run. With no books the
+    # supervisor IS the wrapper, stays up with its child, and the deadline is
+    # what ends the attempt. `case_argv` covers the claim itself.
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    served = tmp / "serve-argv.log"
+    # A "vllm" that records how it was invoked, stays up and never serves: the
+    # exact shape of the gremlin. Its own argv is the composed serving command,
+    # which is more direct evidence than the claim wrapped around it.
+    # An absolute interpreter for the same reason the `arm` double uses one: the
+    # sandbox PATH holds only the doubles, so a `/bin/sh` script calling `sleep`
+    # would die rc=127 and leave through the early-exit path instead.
+    mute = tmp / "mute-vllm"
+    mute.write_text(
+        f"#!{sys.executable}\n"
+        "import sys, time\n"
+        f"open({str(served)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "time.sleep(90)\n")
+    mute.chmod(0o755)
+
+    try:
+        # Two different ports on purpose: the attempt's and the shipped one. If
+        # the kernel ever handed back the same one twice the port assertions
+        # below would pass without discriminating anything, so insist.
+        attempt_port, restore_port = free_port(), free_port()
+        while restore_port == attempt_port:
+            restore_port = free_port()
+        out = run_self(env, "try-vision", "--vllm-bin", str(mute),
+                       "--port", attempt_port, "--restore-port", restore_port,
+                       "--deadline", "12", "--restore-timeout", "12",
+                       "--", "--mm-processor-cache-gb", "0",
+                       timeout=420)
+
+        invocations = served.read_text().splitlines() if served.exists() else []
+        check(len(invocations) == 2,
+              f"expected a vision attempt then a restore, got {invocations}")
+        # ⚠️ The defect this guards: `restore_known_good` used to inherit the
+        # attempt's port, so a test on another port would have put the
+        # operator's chat back where nothing points at it.
+        check(f"--port {attempt_port}" in invocations[0],
+              f"the attempt did not use the test port: {invocations[0]}")
+        check(f"--port {restore_port}" in invocations[1],
+              f"the restore did not land on the shipped port {restore_port} — it "
+              f"would strand the chat: {invocations[1]}")
+        # An experiment flag belongs to the attempt alone. A restore carrying it
+        # would quietly ship whatever was being tested.
+        check("--mm-processor-cache-gb 0" in invocations[0],
+              f"the attempt dropped its experiment arguments: {invocations[0]}")
+        check("--mm-processor-cache-gb" not in invocations[1],
+              f"the restore inherited an experiment flag: {invocations[1]}")
+        check("--no-language-model-only" in invocations[0],
+              f"the vision attempt did not turn the tower on: {invocations[0]}")
+        check("--no-language-model-only" not in invocations[1],
+              f"the restore carried the vision flag, so it is not the known-good "
+              f"config: {invocations[1]}")
+        check("--language-model-only" in invocations[1],
+              f"the restore is not the shipped text-only config: {invocations[1]}")
+
+        captures = sorted((home / ".local" / "state" / "dsh-serve" / "unreachable")
+                          .glob("unreachable-*.txt"))
+        check(captures, "restored without capturing any evidence first")
+        text = captures[0].read_text()
+        for heading in ("connect attempt", "kernel counter DELTA",
+                        "listener for this port"):
+            check(heading in text,
+                  f"capture has no {heading!r} section: {text[:400]!r}")
+
+        check(out.returncode == RC_RESTORE_FAILED,
+              f"expected rc {RC_RESTORE_FAILED} when the restore cannot come up "
+              f"either, got {out.returncode}: {out.stderr!r}")
+        check("RESTORE FAILED" in out.stderr or "RESTORE BLOCKED" in out.stderr,
+              f"a chat left down was not announced loudly: {out.stderr!r}")
+    finally:
+        # RC_RESTORE_FAILED deliberately leaves the failed restore running for a
+        # human, so this case must reap it — by the pid the launcher recorded,
+        # never by pattern.
+        stale = json.loads(
+            (home / ".local" / "state" / "dsh-serve" / "state.json").read_text()
+        ) if (home / ".local" / "state" / "dsh-serve" / "state.json").exists() else {}
+        for pid in (stale.get("vllm_pgid"), stale.get("supervisor_pid")):
+            if not pid:
+                continue
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+
+
+def uds_upstream(path: Path, chunks: list[bytes], delay: float):
+    """A Unix-socket stand-in for vLLM that dribbles a response out over time."""
+    import threading
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(8)
+
+    def one(conn: socket.socket) -> None:
+        with conn:
+            try:
+                if not conn.recv(PROXY_CHUNK):
+                    return          # a readiness probe that connected and left
+                conn.sendall(b"HTTP/1.1 200 OK\r\n"
+                             b"Content-Type: text/event-stream\r\n\r\n")
+                for chunk in chunks:
+                    time.sleep(delay)
+                    conn.sendall(chunk)
+            except OSError:
+                return
+
+    def serve() -> None:
+        # A loop, not a single accept: `spawn_proxy`'s readiness probe opens a
+        # connection of its own through the proxy, and it must not consume the
+        # one the test itself needs.
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=one, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener
+
+
+def spawn_proxy(port: str, uds: Path) -> subprocess.Popen:
+    """The shipped `_proxy` verb, launched the way the supervisor launches it."""
+    proxy = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_proxy",
+         "--port", str(port), "--uds", str(uds)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        probe = socket.socket()
+        probe.settimeout(0.5)
+        try:
+            probe.connect((HOST, int(port)))
+            probe.close()
+            return proxy
+        except OSError:
+            probe.close()
+            time.sleep(0.1)
+    proxy.kill()
+    raise Failure(f"proxy never listened on {HOST}:{port}")
+
+
+def case_proxy_streams(tmp: Path) -> None:
+    """⭐ The proxy must RELAY a stream, not accumulate it.
+
+    Chat traffic is streamed token by token. A proxy that buffered whole
+    responses would pass every health check and the vision colour probe while
+    turning live output into a silence followed by a wall of text — a
+    regression neither of those can see, which is why it is asserted here.
+    """
+    uds = tmp / "upstream.sock"
+    chunks = [b"data: one\n\n", b"data: two\n\n", b"data: three\n\n"]
+    delay = 0.4
+    listener = uds_upstream(uds, chunks, delay)
+    port = free_port()
+    proxy = spawn_proxy(port, uds)
+    try:
+        client = socket.create_connection((HOST, int(port)), timeout=15)
+        client.settimeout(15)
+        client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\n"
+                       b"Host: localhost\r\nContent-Length: 0\r\n\r\n")
+        first = last = None
+        body = b""
+        started = time.monotonic()
+        while True:
+            try:
+                data = client.recv(PROXY_CHUNK)
+            except (TimeoutError, socket.timeout):
+                break
+            if not data:
+                break
+            now = time.monotonic() - started
+            first = now if first is None else first
+            last = now
+            body += data
+            if all(chunk in body for chunk in chunks):
+                break
+        client.close()
+
+        check(first is not None, "nothing came back through the proxy")
+        for chunk in chunks:
+            check(chunk in body, f"{chunk!r} never arrived: {body!r}")
+        # The upstream finishes writing at ~len(chunks)*delay. A buffering proxy
+        # delivers everything in one burst at the end, so first and last arrival
+        # would coincide; a relaying one spreads them across the whole window.
+        spread = last - first
+        check(spread > delay,
+              f"arrivals spanned only {spread:.2f}s across a "
+              f"{len(chunks) * delay:.1f}s stream — the proxy is buffering, "
+              "not relaying")
+    finally:
+        proxy.terminate()
+        proxy.wait(timeout=10)
+        listener.close()
+
+
+def case_proxy_death_refuses(tmp: Path) -> None:
+    """A dead proxy must look like a dead server: refused, never a hang.
+
+    This is why the proxy is a separate process. If it were a thread, its death
+    would leave the supervisor holding the listening socket and consumers would
+    hang against something that no longer relays — the silent failure.
+    """
+    uds = tmp / "upstream.sock"
+    listener = uds_upstream(uds, [b"data: x\n\n"], 0.0)
+    port = free_port()
+    proxy = spawn_proxy(port, uds)
+    proxy.terminate()
+    proxy.wait(timeout=10)
+    listener.close()
+
+    probe = socket.socket()
+    probe.settimeout(5)
+    started = time.monotonic()
+    try:
+        probe.connect((HOST, int(port)))
+        raise Failure(f"{HOST}:{port} still accepted after the proxy died")
+    except (TimeoutError, socket.timeout):
+        raise Failure(f"{HOST}:{port} HUNG after the proxy died; it must refuse")
+    except ConnectionRefusedError:
+        elapsed = time.monotonic() - started
+        check(elapsed < 2.0, f"refusal took {elapsed:.1f}s; should be immediate")
+    finally:
+        probe.close()
+
+
+def case_proxy_never_outlives_server(tmp: Path) -> None:
+    """The proxy must not survive the server it fronts.
+
+    An orphan proxy left holding the consumers' port would accept connections
+    and relay them into a socket with nothing behind it — a port that looks
+    served and is not, and one that would block the next start.
+    """
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    mute = tmp / "mute-vllm"
+    mute.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(120)\n")
+    mute.chmod(0o755)
+    uds = tmp / "vllm.sock"
+    port = free_port()
+
+    supervisor = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_supervise",
+         "--vllm-bin", str(mute), "--port", port, "--uds", str(uds),
+         "--vram-timeout", "3"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    state = home / ".local" / "state" / "dsh-serve" / "state.json"
+    try:
+        proxy_pid = None
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if state.exists():
+                try:
+                    proxy_pid = json.loads(state.read_text()).get("proxy_pid")
+                except ValueError:
+                    proxy_pid = None
+                if proxy_pid:
+                    break
+            time.sleep(0.2)
+        check(proxy_pid is not None, "supervisor recorded no proxy_pid")
+        check(pid_alive(proxy_pid), f"proxy {proxy_pid} is not running")
+        # The port answers at TCP level from the start — that is the point.
+        probe = socket.socket()
+        probe.settimeout(5)
+        probe.connect((HOST, int(port)))
+        probe.close()
+
+        supervisor.terminate()
+        supervisor.wait(timeout=60)
+
+        check(not pid_alive(proxy_pid),
+              f"proxy {proxy_pid} outlived the supervisor — it still holds "
+              f"{HOST}:{port}")
+        after = socket.socket()
+        after.settimeout(5)
+        try:
+            after.connect((HOST, int(port)))
+            raise Failure(f"{HOST}:{port} still accepts after teardown")
+        except ConnectionRefusedError:
+            pass
+        except (TimeoutError, socket.timeout):
+            raise Failure(f"{HOST}:{port} hangs after teardown; must refuse")
+        finally:
+            after.close()
+    finally:
+        if supervisor.poll() is None:
+            supervisor.kill()
+            supervisor.wait()
+
+
+def case_uds_restore_is_direct_tcp(tmp: Path) -> None:
+    """⛔ `--uds` on the attempt must never reach the restore.
+
+    Known good is text-only, direct TCP, no proxy. A restore into the UDS path
+    would be a restore into the unproven thing the attempt was testing.
+    """
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    served = tmp / "serve-argv.log"
+    mute = tmp / "mute-vllm"
+    mute.write_text(
+        f"#!{sys.executable}\n"
+        "import sys, time\n"
+        f"open({str(served)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "time.sleep(90)\n")
+    mute.chmod(0o755)
+    port = free_port()
+
+    try:
+        run_self(env, "try-vision", "--vllm-bin", str(mute), "--uds",
+                 "--port", port, "--restore-port", port,
+                 "--deadline", "12", "--restore-timeout", "12", timeout=420)
+
+        invocations = served.read_text().splitlines() if served.exists() else []
+        check(len(invocations) == 2,
+              f"expected an attempt then a restore, got {invocations}")
+        check("--uds" in invocations[0],
+              f"the attempt did not serve on a Unix socket: {invocations[0]}")
+        check("--host" not in invocations[0],
+              f"the attempt kept a TCP bind alongside the socket: {invocations[0]}")
+        check("--uds" not in invocations[1],
+              f"the restore inherited the unproven UDS path: {invocations[1]}")
+        check(f"--host {HOST}" in invocations[1] and "--port" in invocations[1],
+              f"the restore is not direct TCP: {invocations[1]}")
+    finally:
+        path = home / ".local" / "state" / "dsh-serve" / "state.json"
+        stale = json.loads(path.read_text()) if path.exists() else {}
+        for pid in (stale.get("proxy_pid"), stale.get("vllm_pgid"),
+                    stale.get("supervisor_pid")):
+            if not pid:
+                continue
+            for killer in (os.killpg, os.kill):
+                try:
+                    killer(pid, signal.SIGKILL)
+                    break
+                except (ProcessLookupError, PermissionError, OSError):
+                    continue
+
+
+CASES = {
+    "argv": case_argv,
+    "uds-restore": case_uds_restore_is_direct_tcp,
+    "proxy-stream": case_proxy_streams,
+    "proxy-death": case_proxy_death_refuses,
+    "proxy-lifecycle": case_proxy_never_outlives_server,
+    "vision-probe": case_vision_probe_asserts_on_the_answer,
+    "vision-restore": case_vision_captures_then_restores,
+    "prio": case_prio_override_needs_reason,
+    "would-block": case_would_block_names_who,
+    "books-missing-arm": case_books_present_arm_missing,
+    "books-absent": case_books_absent_runs_unclaimed,
+    "stop-vram": case_stop_requires_vram_return,
+    "no-release": case_refuses_to_release,
+    "kv-pool": case_kv_pool_coherence,
+    "pgroup": case_pgroup,
+    "stop-mid-start": case_stop_mid_start,
+    "already-running": case_already_running,
+    "json-payload": case_json_payload,
+    "doc-example": case_doc_example,
+    "status-never-wedges": case_status_never_wedges,
+    "unreachable-warning-fires": case_unreachable_warning_fires,
+    "unreachable-warning-uds-silent": case_unreachable_warning_uds_silent,
+    "mid-session-capture-fires": case_mid_session_capture_fires,
+    "mid-session-capture-silent": case_mid_session_capture_silent_on_one_miss,
+}
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    selected = {args.case: CASES[args.case]} if args.case else CASES
+    failures = 0
+    for name, case in selected.items():
+        with tempfile.TemporaryDirectory(prefix=f"dsh-serve-{name}-") as tmp:
+            try:
+                case(Path(tmp))
+                print(f"ok    {name}")
+            except (Failure, AssertionError) as exc:
+                print(f"FAIL  {name}: {exc}")
+                failures += 1
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                print(f"ERROR {name}: {type(exc).__name__}: {exc}")
+                failures += 1
+    print(f"\n{len(selected) - failures}/{len(selected)} passed")
+    return RC_OK if failures == 0 else RC_FAIL
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="dsh-serve", description=__doc__.splitlines()[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"app {APP!r} on pool {POOL!r}, always --exclusive, "
+               f"registered priority {REGISTERED_PRIO!r}")
+    verbs = parser.add_subparsers(dest="verb", required=True)
+
+    start = verbs.add_parser("start", help="claim the GPU and bring the server up")
+    start.add_argument("--json", action="store_true", help=JSON_HELP)
+    start.add_argument("--if-not-running", action="store_true",
+                       help="succeed (rc 0) when a server is ALREADY serving "
+                            "the configuration this call asks for, instead of "
+                            "refusing with rc 7. A server running anything "
+                            "else is still rc 8 — this makes the verb "
+                            "idempotent, never permissive")
+    start.add_argument("--prio", choices=["operator", "interactive", "service",
+                                          "batch", "fleet", "test"],
+                       help=f"override the registered default ({REGISTERED_PRIO}); "
+                            "an override needs a reason in --purpose")
+    start.add_argument("--purpose", help="journaled; what a human reading "
+                                         "`arm status` at 2am needs")
+    start.add_argument("--wait", type=int, metavar="SECS",
+                       help="queue for the pool instead of refusing")
+    start.add_argument("--vllm-bin", default=str(DEFAULT_VLLM_BIN),
+                       help=f"vllm executable (default: {DEFAULT_VLLM_BIN})")
+    start.add_argument("--port", type=int, default=PORT,
+                       help=f"serving port (default: {PORT}; ~/.dsh/settings.yaml "
+                            "must name the same one)")
+    start.add_argument("--ready-timeout", type=float,
+                       default=DEFAULT_READY_TIMEOUT_S, metavar="SECS")
+    start.add_argument("--vram-timeout", type=float,
+                       default=VRAM_RETURN_TIMEOUT_S, metavar="SECS",
+                       help="how long teardown waits for the card to come back "
+                            f"before refusing to release the lease (default: "
+                            f"{VRAM_RETURN_TIMEOUT_S:.0f})")
+    start.add_argument("--uds", action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help="serve vLLM on a Unix socket behind this "
+                            "launcher's TCP proxy, so the port is held by a "
+                            "socket that binds and listens together. Consumers "
+                            "see no difference. ON by default since 2026-09-04 "
+                            "(TD ruling): a census of server.log found direct "
+                            "TCP unreachable on 14/20 real launches (a "
+                            "measured 70%% hard-failure rate, each one holding "
+                            "the GPU for up to --ready-timeout before "
+                            "admitting it — see "
+                            "vllm-loopback-unreachable-after-config-change), "
+                            "against 0/13 for --uds over ~9 days 3 hours of "
+                            "measured serving life. The soft failure classes "
+                            "(a dropped mid-stream connection, a hang that "
+                            "does not kill the proxy) were NOT separately "
+                            "measurable — nothing here watches for them — so "
+                            "this is a documented gap, not a clean bill of "
+                            "health. Pass --no-uds for the old direct-TCP "
+                            "path")
+    start.add_argument("--model", metavar="PROFILE",
+                       help="a profile name from the model register "
+                            "(`dsh-serve models` lists them). Omit to use the "
+                            "register's DEFAULT_PROFILE — AS3's launch line "
+                            "passes none and must keep deferring to it. An "
+                            "unknown name refuses loudly; it never falls back")
+    start.add_argument("vllm_args", nargs="*",
+                       help="extra arguments appended to the vllm command")
+    start.set_defaults(func=cmd_start)
+
+    vision = verbs.add_parser(
+        "try-vision", help="start with the vision tower, prove an image "
+                           "round-trips, or restore the text-only server")
+    vision.add_argument("--deadline", type=float,
+                        default=VISION_READY_TIMEOUT_S, metavar="SECS",
+                        help="wall-clock allowance for the vision server to "
+                             "answer /health before it is torn down and the "
+                             f"known-good config restored (default: "
+                             f"{VISION_READY_TIMEOUT_S:.0f})")
+    vision.add_argument("--json", action="store_true", help=JSON_HELP)
+    vision.add_argument("--if-not-running", action="store_true",
+                        help="succeed (rc 0) without restarting anything when "
+                             "the server already up passes the image test. The "
+                             "test is always the round trip, never the recorded "
+                             "arguments")
+    vision.add_argument("--restore-timeout", type=float,
+                        default=DEFAULT_READY_TIMEOUT_S, metavar="SECS",
+                        help="readiness allowance for the restore itself "
+                             f"(default: {DEFAULT_READY_TIMEOUT_S:.0f})")
+    vision.add_argument("--prio", choices=["operator", "interactive", "service",
+                                           "batch", "fleet", "test"])
+    vision.add_argument("--purpose")
+    vision.add_argument("--wait", type=int, metavar="SECS")
+    vision.add_argument("--vllm-bin", default=str(DEFAULT_VLLM_BIN))
+    vision.add_argument("--port", type=int, default=PORT,
+                        help=f"port for the vision ATTEMPT (default: {PORT})")
+    vision.add_argument("--restore-port", type=int, default=PORT,
+                        help="port the known-good text-only server is restored "
+                             f"on (default: {PORT}). Deliberately independent "
+                             "of --port: a test on another port must not be "
+                             "able to strand the chat where nothing points")
+    vision.add_argument("--vram-timeout", type=float,
+                        default=VRAM_RETURN_TIMEOUT_S, metavar="SECS")
+    vision.add_argument("--uds", action="store_true",
+                        help="run the ATTEMPT with vLLM on a Unix socket behind "
+                             "this launcher's TCP proxy. The restore is always "
+                             "text-only direct TCP regardless")
+    vision.add_argument("--model", metavar="PROFILE",
+                        help="a profile name from the model register for the "
+                             "ATTEMPT only (`dsh-serve models` lists them). "
+                             "Omit to use the register's DEFAULT_PROFILE. The "
+                             "restore, if it happens, always uses "
+                             "KNOWN_GOOD_PROFILE instead — never this value")
+    vision.add_argument("vllm_args", nargs="*",
+                        help="extra arguments for the vision ATTEMPT only "
+                             "(after `--`). The restore never carries them: it "
+                             "is the shipped configuration or it is not a "
+                             "restore")
+    vision.set_defaults(func=cmd_try_vision)
+
+    stop = verbs.add_parser("stop", help="give the card back, and prove it")
+    stop.add_argument("--timeout", type=float, default=STOP_WAIT_S, metavar="SECS")
+    stop.add_argument("--json", action="store_true", help=JSON_HELP)
+    stop.set_defaults(func=cmd_stop)
+
+    status = verbs.add_parser("status", help="what this launcher is holding")
+    status.add_argument("--json", action="store_true", help=JSON_HELP)
+    status.set_defaults(func=cmd_status)
+
+    models = verbs.add_parser(
+        "models", help="list the model register and validate each profile "
+                       "without loading it or touching the GPU")
+    models.set_defaults(func=cmd_models)
+
+    test = verbs.add_parser("selftest", help="assert the claim and the teardown")
+    test.add_argument("--case", choices=sorted(CASES))
+    test.set_defaults(func=cmd_selftest)
+
+    supervise = verbs.add_parser("_supervise")
+    supervise.add_argument("--vllm-bin", required=True)
+    supervise.add_argument("--port", type=int, default=PORT)
+    supervise.add_argument("--vram-timeout", type=float,
+                           default=VRAM_RETURN_TIMEOUT_S)
+    supervise.add_argument("--arbitrated", action="store_true")
+    supervise.add_argument("--uds")
+    supervise.add_argument("vllm_args", nargs="*")
+    supervise.set_defaults(func=cmd_supervise)
+
+    proxy = verbs.add_parser("_proxy")
+    proxy.add_argument("--port", type=int, required=True)
+    proxy.add_argument("--uds", required=True)
+    proxy.set_defaults(func=cmd_proxy)
+
+    args = parser.parse_args()
+    if not getattr(args, "json", False):
+        return args.func(args)
+    # Caught here rather than at each `die()`: a machine caller must get the
+    # object on every exit path, including the refusals that never reach a
+    # verb's return statement.
+    try:
+        rc = args.func(args)
+    except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else RC_FAIL
+    print(json.dumps(json_payload(rc)), flush=True)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
