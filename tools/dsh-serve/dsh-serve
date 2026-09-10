@@ -100,7 +100,6 @@ APP = "dsh"
 POOL = "gpu0"
 REGISTERED_PRIO = "fleet"
 
-SERVED_MODEL_NAME = "Qwen3.8-27B"
 HOST = "127.0.0.1"
 PORT = 8001
 DEFAULT_VLLM_BIN = Path.home() / ".venvs" / "vllm" / "bin" / "vllm"
@@ -251,7 +250,7 @@ def vllm_args(profile: dict, port: int, uds: str | None = None) -> list[str]:
     return [
         "serve", str(profile["path"]),
         *address,
-        "--served-model-name", SERVED_MODEL_NAME,
+        "--served-model-name", profile["served_model_name"],
         "--max-model-len", str(profile["max_model_len"]),
         "--language-model-only",
         "--kv-cache-memory-bytes", str(profile["kv_cache_memory_bytes"]),
@@ -593,7 +592,7 @@ def settings_path() -> Path:
     return Path.home() / ".dsh" / "settings.yaml"
 
 
-def check_settings_context_window(max_model_len: int) -> str | None:
+def check_settings_context_window(max_model_len: int, served_model_name: str) -> str | None:
     """Why `~/.dsh/settings.yaml`'s `contextWindow` disagrees with the
     profile about to be served, or None.
 
@@ -603,6 +602,12 @@ def check_settings_context_window(max_model_len: int) -> str | None:
     compaction. Nothing else validates this pairing — a per-profile window
     makes it a per-profile invariant, checked here, before claiming the GPU,
     same failure class as `check_kv_pool_fits_window`.
+
+    Matched by `served_model_name`, not a fixed constant: each profile has
+    its own id (`models.py`, `served_model_name`) and its own window, so a
+    settings.yaml with entries for both profiles is checked against the ONE
+    entry that names the profile actually being launched — never a stale
+    global that would check the wrong profile's window against this one's id.
 
     Degrades to a WARNING, never a refusal, when settings.yaml or its
     `contextWindow` cannot be read: an unreadable INPUT to a check is not
@@ -617,17 +622,17 @@ def check_settings_context_window(max_model_len: int) -> str | None:
             "--max-model-len pairing is unchecked")
         return None
     match = re.search(
-        r"-\s+id:\s*" + re.escape(SERVED_MODEL_NAME) + r"\b.*?contextWindow:\s*(\d+)",
+        r"-\s+id:\s*" + re.escape(served_model_name) + r"\b.*?contextWindow:\s*(\d+)",
         text, re.DOTALL)
     if match is None:
-        say(f"WARNING: no contextWindow found for model id {SERVED_MODEL_NAME!r} "
+        say(f"WARNING: no contextWindow found for model id {served_model_name!r} "
             f"in {path}, so the pairing is unchecked")
         return None
     declared = int(match.group(1))
     if declared == max_model_len:
         return None
     return (
-        f"{path} declares contextWindow {declared} for {SERVED_MODEL_NAME!r}, "
+        f"{path} declares contextWindow {declared} for {served_model_name!r}, "
         f"but this launch uses --max-model-len {max_model_len}. The harness "
         f"sizes compaction from contextWindow, so a mismatch turns a chat "
         f"overflow into a hard mid-turn failure instead of a proactive "
@@ -808,7 +813,8 @@ def accept_running(live: dict, serve_args: list[str]) -> int:
         die(f"already running, but NOT as requested. Running: {recorded}. "
             f"Requested: {serve_args}. `dsh-serve stop` first if you need the "
             "requested configuration.", RC_CONFIG_MISMATCH)
-    say(f"already running as requested: {SERVED_MODEL_NAME} on "
+    served = last_flag_value(serve_args, "--served-model-name")
+    say(f"already running as requested: {served} on "
         f"http://{HOST}:{live.get('port', PORT)}, vllm pid "
         f"{live.get('vllm_pid')}; nothing started")
     return RC_OK
@@ -893,10 +899,12 @@ def json_payload(rc: int) -> dict:
     display only — parsing it is the mistake `--json` exists to remove.
 
     `profile` (additive, 2026-08-31) is the register profile name this
-    launcher resolved and started — `model_served`/`model_requested` are both
-    always `SERVED_MODEL_NAME`, so neither can say WHICH weights answered a
-    request; `/v1/models`'s `root` field answers that too, but only once the
-    server is already up. `profile` answers it from the state file alone.
+    launcher resolved and started. Each profile has its own
+    `served_model_name` (2026-09-04), so `model_served`/`model_requested`
+    now say WHICH weights answered too — but `profile` is still the field to
+    read: it names the register entry directly, rather than requiring a
+    consumer to reverse a served id back into a profile name if the register
+    ever changes what id a profile serves.
     """
     live = read_state() or {}
     port = live_port(live if live else None)
@@ -1413,6 +1421,12 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         return RC_FAIL
 
     wrapper_pid = os.getppid()            # `arm run`, or `start` when unclaimed
+    # Read from the composed argv, not the register: `start` already resolved
+    # the profile and built this exact `--served-model-name` into
+    # `args.vllm_args`, so re-deriving it here can never disagree with what
+    # is actually being served — same reasoning as `check_kv_pool_fits_window`
+    # reading the model path from `serve_args` rather than a profile value.
+    served_model_name = last_flag_value(args.vllm_args, "--served-model-name")
     write_state({
         "phase": "serving",
         "serve_args": list(args.vllm_args),
@@ -1428,7 +1442,12 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         "arbitrated": args.arbitrated,
         "host": HOST,
         "port": args.port,
-        "model": SERVED_MODEL_NAME,
+        "model": served_model_name,
+        # `profile` (2026-08-27) used to be written only by `start`'s own
+        # `starting`-phase record and never refreshed here, so it went stale
+        # the instant the phase flipped to `serving` — this write is what
+        # closes that (dsh-serve-state-profile-field-always-null).
+        "profile": args.profile,
         # Stamped here, after the exec above — not at verb invocation. It is
         # the wall clock's reading of when this vLLM began, to within the
         # milliseconds between `Popen` and this line.
@@ -1666,7 +1685,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     if incoherent:
         die(incoherent, RC_FAIL)
 
-    drifted = check_settings_context_window(profile["max_model_len"])
+    drifted = check_settings_context_window(profile["max_model_len"],
+                                            profile["served_model_name"])
     if drifted:
         die(drifted, RC_FAIL)
 
@@ -1682,13 +1702,14 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     prio = args.prio or REGISTERED_PRIO
     purpose = args.purpose or (
-        f"dsh: {SERVED_MODEL_NAME} ({profile_name}) NVFP4 vLLM server on "
-        f"{HOST}:{args.port} (deepseek-harness backend)")
+        f"dsh: {profile['served_model_name']} ({profile_name}) NVFP4 vLLM "
+        f"server on {HOST}:{args.port} (deepseek-harness backend)")
 
     supervise = [
         sys.executable, os.path.abspath(__file__), "_supervise",
         "--vllm-bin", str(vllm_bin), "--port", str(args.port),
         "--vram-timeout", str(args.vram_timeout),
+        "--profile", profile_name,
     ]
     if uds:
         supervise += ["--uds", uds]
@@ -1731,7 +1752,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "host": HOST,
         "port": args.port,
         "uds": uds,
-        "model": SERVED_MODEL_NAME,
+        "model": profile["served_model_name"],
         "profile": profile_name,
         "serve_args": serve_args,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1809,7 +1830,7 @@ def await_ready(wrapper: subprocess.Popen, arbitrated: bool,
         if server_ready(port):
             live = read_state() or {}
             used = read_gpu_used_mib()
-            say(f"ready: {SERVED_MODEL_NAME} on http://{HOST}:{port} "
+            say(f"ready: {live.get('model')} on http://{HOST}:{port} "
                 f"(vllm pid {live.get('vllm_pid')}, group {live.get('vllm_pgid')}"
                 f"{'' if used is None else f', {used} MiB VRAM in use'})")
             if arbitrated:
@@ -1920,11 +1941,18 @@ def solid_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
             + chunk(b"IEND", b""))
 
 
-def image_probe(port: int, timeout: float = 180.0) -> tuple[bool, str]:
-    """Send one image and check the answer. Returns (passed, what happened)."""
+def image_probe(port: int, served_model_name: str,
+                timeout: float = 180.0) -> tuple[bool, str]:
+    """Send one image and check the answer. Returns (passed, what happened).
+
+    `served_model_name` must match the target server's own
+    `--served-model-name`: vLLM rejects a request whose `model` field
+    disagrees with what it was launched to serve, and each profile now has
+    its own — this probe has no default to fall back on.
+    """
     png = solid_png(VISION_PROBE_EDGE, VISION_PROBE_EDGE, VISION_PROBE_RGB)
     payload = {
-        "model": SERVED_MODEL_NAME,
+        "model": served_model_name,
         "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {
                 "url": "data:image/png;base64," + base64.b64encode(png).decode()}},
@@ -2064,9 +2092,15 @@ def accept_proven_vision(port: int) -> int | None:
         return None
     if live_port(live) != port or not server_ready(port):
         return None
+    served_model_name = live.get("model")
+    if not served_model_name:
+        # A record from before per-profile served ids existed, or otherwise
+        # missing the field: unknown what to ask the server to be, so fall
+        # through to the full guarded start rather than guessing.
+        return None
     say(f"a server is already serving on {HOST}:{port}; testing it for the eyes "
         "before considering a restart")
-    passed, detail = image_probe(port)
+    passed, detail = image_probe(port, served_model_name)
     if not passed:
         say(f"it is up but cannot take an image ({detail}); continuing with the "
             "guarded vision start")
@@ -2080,6 +2114,12 @@ def accept_proven_vision(port: int) -> int | None:
 def cmd_try_vision(args: argparse.Namespace) -> int:
     """Bring the server up with the vision tower and prove an image round-trips,
     or put the known-good text-only server back."""
+    # Resolved once, up front: the ATTEMPT's own served id, for the image
+    # test below. Never `args.model` re-read later — `cmd_start` inside this
+    # verb resolves it again independently for the actual launch, and both
+    # reads must agree, which only holds if neither depends on state that
+    # could change between them.
+    _, attempt_profile = resolve_profile(args.model)
     if args.if_not_running:
         already = accept_proven_vision(args.port)
         if already is not None:
@@ -2115,7 +2155,7 @@ def cmd_try_vision(args: argparse.Namespace) -> int:
         return restore_known_good(args, "the vision server never answered")
 
     say("vision server is up; running the end-to-end image test")
-    passed, detail = image_probe(args.port)
+    passed, detail = image_probe(args.port, attempt_profile["served_model_name"])
     if not passed:
         say(f"IMAGE TEST FAILED: {detail}")
         capture_unreachable_evidence(
@@ -2336,7 +2376,8 @@ def cmd_models(_args: argparse.Namespace) -> int:
             ok = False
             say(f"{name}{tag}: INVALID — {path}/config.json: {exc}")
             continue
-        say(f"{name}{tag}: {path} — max_model_len {profile['max_model_len']}, "
+        say(f"{name}{tag}: {path} — served as {profile['served_model_name']!r}, "
+            f"max_model_len {profile['max_model_len']}, "
             f"kv_cache_memory_bytes {profile['kv_cache_memory_bytes']}")
         purpose = profile.get("purpose")
         if purpose:
@@ -2458,6 +2499,7 @@ def case_argv(tmp: Path) -> None:
     the question this launcher puts to ARM, independent of any answer."""
     env, _ = sandbox(tmp, books=True, arm=True)
     port = free_port()
+    _, default_profile = resolve_profile(None)
     out = run_self(env, "start", "--vllm-bin", "/bin/true", "--port", port,
                    "--ready-timeout", "20")
     recorded = [json.loads(line) for line in
@@ -2472,7 +2514,7 @@ def case_argv(tmp: Path) -> None:
     check(argv[argv.index("--prio") + 1] == REGISTERED_PRIO,
           f"--prio is not {REGISTERED_PRIO}: {argv}")
     purpose = argv[argv.index("--purpose") + 1]
-    check(SERVED_MODEL_NAME in purpose and port in purpose,
+    check(default_profile["served_model_name"] in purpose and port in purpose,
           f"--purpose names neither the model nor the port: {purpose!r}")
     check("--" in argv and argv[argv.index("--") + 1] != "vllm",
           "vllm must not be arm run's direct child; the supervisor must be")
@@ -2540,6 +2582,7 @@ def case_stop_requires_vram_return(tmp: Path) -> None:
     env, home = sandbox(tmp, books=False, arm=False, smi_mib="26000")
     state = home / ".local" / "state" / "dsh-serve"
     state.mkdir(parents=True, exist_ok=True)
+    _, default_profile = resolve_profile(None)
     # A stand-in supervisor that dies on the SIGTERM `stop` sends, leaving the
     # card reading 26000 MiB against an 800 MiB baseline: the exact defect —
     # the process is gone and the VRAM is not back.
@@ -2552,7 +2595,8 @@ def case_stop_requires_vram_return(tmp: Path) -> None:
             "supervisor_start_ticks": pid_start_ticks(stand_in.pid),
             "vllm_pid": stand_in.pid, "vllm_pgid": stand_in.pid,
             "vram_baseline_mib": 800, "arbitrated": False,
-            "host": HOST, "port": int(free_port()), "model": SERVED_MODEL_NAME,
+            "host": HOST, "port": int(free_port()),
+            "model": default_profile["served_model_name"],
         }))
         out = run_self(env, "stop", "--timeout", "20")
         check(not pid_alive(stand_in.pid), "stop did not signal the recorded pid")
@@ -2586,7 +2630,7 @@ def case_refuses_to_release(tmp: Path) -> None:
     supervisor = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "_supervise",
          "--vllm-bin", str(leaky), "--arbitrated", "--vram-timeout", "3",
-         "--port", free_port()],
+         "--port", free_port(), "--profile", "unsloth"],
         stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, env=env)
     try:
         deadline = time.monotonic() + 45
@@ -2631,13 +2675,15 @@ def case_stop_mid_start(tmp: Path) -> None:
     victim = subprocess.Popen(["sleep", "120"], start_new_session=True,
                               stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL)
+    _, default_profile = resolve_profile(None)
     try:
         state = write_fake_state(home, {
             "phase": "starting",
             "wrapper_pid": victim.pid,
             "wrapper_start_ticks": pid_start_ticks(victim.pid),
             "arbitrated": False, "host": HOST, "port": int(free_port()),
-            "uds": None, "model": SERVED_MODEL_NAME, "serve_args": [],
+            "uds": None, "model": default_profile["served_model_name"],
+            "serve_args": [],
             "started_at": "2026-08-27T00:00:00+0300",
         })
         out = run_self(env, "stop", "--timeout", "30")
@@ -2677,7 +2723,7 @@ def case_already_running(tmp: Path) -> None:
             "wrapper_start_ticks": pid_start_ticks(holder.pid),
             "vllm_pid": holder.pid, "vllm_pgid": holder.pid,
             "arbitrated": False, "host": HOST, "port": int(port), "uds": None,
-            "model": SERVED_MODEL_NAME, "vram_baseline_mib": 0,
+            "model": default_profile["served_model_name"], "vram_baseline_mib": 0,
             "serve_args": sandboxed,
             "started_at": "2026-08-27T00:00:00+0300",
         }
@@ -3094,6 +3140,87 @@ def case_kv_pool_coherence(tmp: Path) -> None:
           f"the refusal does not state what the window actually needs: {out.stderr!r}")
 
 
+def case_settings_context_window(tmp: Path) -> None:
+    """`check_settings_context_window` had zero selftest coverage despite being
+    the check that refused a real launch (2026-09-10) — this closes that gap.
+
+    Matched by `served_model_name`, which is now per-profile, so the discriminating
+    assertion is that a settings.yaml holding BOTH profiles' entries is checked
+    against the ONE entry naming the profile actually being launched: a mismatch on
+    the profile NOT being started must never refuse, and a mismatch on the one that
+    IS must always refuse, by name — proven in both directions on both profiles so
+    this can never pass by coincidentally always refusing or always clearing.
+    """
+    env, home = sandbox(tmp, books=True, arm=True, smi_mib="0")
+    register = load_register()
+    unsloth, abliterated = register["PROFILES"]["unsloth"], register["PROFILES"]["abliterated"]
+    settings = home / ".dsh" / "settings.yaml"
+    argv_log = tmp / "argv.log"
+
+    def write_settings(unsloth_window: int, abliterated_window: int) -> None:
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(
+            "llm-pi-ai:\n  providers:\n    local-qwen:\n      models:\n"
+            f"        - id: {unsloth['served_model_name']}\n"
+            f"          contextWindow: {unsloth_window}\n"
+            f"        - id: {abliterated['served_model_name']}\n"
+            f"          contextWindow: {abliterated_window}\n")
+
+    def refused(out: subprocess.CompletedProcess, profile: dict) -> bool:
+        # The quoted repr, not a bare substring check: unsloth's own id
+        # ("Qwen3.8-27B") is a PREFIX of abliterated's
+        # ("Qwen3.8-27B-abliterated"), so a bare `in` check would read a
+        # refusal naming one profile as also naming the other.
+        return ("declares contextWindow" in out.stderr
+                and repr(profile["served_model_name"]) in out.stderr)
+
+    # unsloth's own entry is right, abliterated's is wrong: launching unsloth
+    # (the default) must clear; launching abliterated must refuse BEFORE the
+    # ARM claim, by name, never against unsloth's entry.
+    write_settings(unsloth["max_model_len"], abliterated["max_model_len"] + 1)
+    out = run_self(env, "start", "--vllm-bin", "/bin/true", "--port", free_port(),
+                   "--ready-timeout", "20")
+    check(not refused(out, unsloth) and not refused(out, abliterated),
+          f"the matching (unsloth, default) profile was refused: {out.stderr!r}")
+    check(argv_log.exists(), f"the matching profile never reached ARM: {out.stderr!r}")
+    argv_log.unlink()
+
+    out = run_self(env, "start", "--model", "abliterated", "--vllm-bin", "/bin/true",
+                   "--port", free_port(), "--ready-timeout", "20")
+    check(out.returncode == RC_FAIL,
+          f"expected rc {RC_FAIL}, got {out.returncode}: {out.stderr!r}")
+    check(refused(out, abliterated),
+          f"the mismatched (abliterated) profile was not refused by its own "
+          f"served id: {out.stderr!r}")
+    check(not refused(out, unsloth),
+          f"the refusal named unsloth's id instead of the profile actually "
+          f"being launched: {out.stderr!r}")
+    check("Refusing before claiming" in out.stderr and not argv_log.exists(),
+          f"refused after the claim reached ARM, not before: {out.stderr!r}")
+
+    # Flip it: abliterated's entry is right, unsloth's is wrong. Proves the
+    # check is not silently always picking one hardcoded entry.
+    write_settings(unsloth["max_model_len"] + 1, abliterated["max_model_len"])
+    out = run_self(env, "start", "--model", "abliterated", "--vllm-bin", "/bin/true",
+                   "--port", free_port(), "--ready-timeout", "20")
+    check(not refused(out, unsloth) and not refused(out, abliterated),
+          f"the matching (abliterated) profile was refused: {out.stderr!r}")
+    check(argv_log.exists(), f"the matching profile never reached ARM: {out.stderr!r}")
+    argv_log.unlink()
+
+    out = run_self(env, "start", "--vllm-bin", "/bin/true", "--port", free_port(),
+                   "--ready-timeout", "20")
+    check(out.returncode == RC_FAIL,
+          f"expected rc {RC_FAIL}, got {out.returncode}: {out.stderr!r}")
+    check(refused(out, unsloth),
+          f"the mismatched (unsloth, default) profile was not refused by its "
+          f"own served id: {out.stderr!r}")
+    check(not refused(out, abliterated),
+          f"the refusal named abliterated's id instead of the profile "
+          f"actually being launched: {out.stderr!r}")
+    check(not argv_log.exists(), "an incoherent pairing still reached ARM")
+
+
 def case_pgroup(_tmp: Path) -> None:
     """The measurement the whole design rests on, with a GPU-free stand-in:
     a wrapper's direct child can exit while its grandchild lives on, and only
@@ -3182,16 +3309,16 @@ def case_vision_probe_asserts_on_the_answer(tmp: Path) -> None:
     try:
         port = server.server_address[1]
         replies.append(reply("blue"))
-        passed, detail = image_probe(port, timeout=20)
+        passed, detail = image_probe(port, "test-model", timeout=20)
         check(not passed, f"passed a 200 that named the wrong colour: {detail}")
 
         replies.append(reply(""))
-        passed, detail = image_probe(port, timeout=20)
+        passed, detail = image_probe(port, "test-model", timeout=20)
         check(not passed, f"passed an empty answer: {detail}")
 
         # Both directions, so the case can never pass by always refusing.
         replies.append(reply("Red."))
-        passed, detail = image_probe(port, timeout=20)
+        passed, detail = image_probe(port, "test-model", timeout=20)
         check(passed, f"failed the right answer: {detail}")
     finally:
         server.shutdown()
@@ -3465,7 +3592,7 @@ def case_proxy_never_outlives_server(tmp: Path) -> None:
     supervisor = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "_supervise",
          "--vllm-bin", str(mute), "--port", port, "--uds", str(uds),
-         "--vram-timeout", "3"],
+         "--vram-timeout", "3", "--profile", "unsloth"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     state = home / ".local" / "state" / "dsh-serve" / "state.json"
     try:
@@ -3562,9 +3689,77 @@ def case_restore_hardcodes_uds(tmp: Path) -> None:
                     continue
 
 
+def case_restore_ignores_the_failed_profile(tmp: Path) -> None:
+    """⛔ The invariant `restore_known_good` exists to hold: whichever profile
+    the failed attempt asked for, the restore always comes back serving
+    `KNOWN_GOOD_PROFILE`'s OWN id — never the id the failed attempt was
+    trying to serve. `start_namespace`'s `model` keyword being required is
+    the code-level guard against this; this case is what actually exercises
+    it with two profiles that answer under DIFFERENT names. Before per-profile
+    served ids this was unprovable — every profile answered under the same
+    name, so a restore that silently inherited the attempt's profile would
+    have looked identical to a correct one.
+    """
+    env, home = sandbox(tmp, books=False, arm=False, smi_mib="0")
+    served = tmp / "serve-argv.log"
+    mute = tmp / "mute-vllm"
+    mute.write_text(
+        f"#!{sys.executable}\n"
+        "import sys, time\n"
+        f"open({str(served)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "time.sleep(90)\n")
+    mute.chmod(0o755)
+
+    register = load_register()
+    known_good_id = register["PROFILES"][register["KNOWN_GOOD_PROFILE"]]["served_model_name"]
+    attempt_id = register["PROFILES"]["abliterated"]["served_model_name"]
+    check(attempt_id != known_good_id,
+          "the attempt and restore profiles must serve different ids for "
+          "this case to discriminate anything")
+
+    try:
+        attempt_port, restore_port = free_port(), free_port()
+        while restore_port == attempt_port:
+            restore_port = free_port()
+        out = run_self(env, "try-vision", "--vllm-bin", str(mute),
+                       "--model", "abliterated",
+                       "--port", attempt_port, "--restore-port", restore_port,
+                       "--deadline", "12", "--restore-timeout", "12", timeout=420)
+
+        invocations = served.read_text().splitlines() if served.exists() else []
+        check(len(invocations) == 2,
+              f"expected an attempt then a restore, got {invocations}")
+        check(f"--served-model-name {attempt_id}" in invocations[0],
+              f"the attempt did not serve the abliterated profile's own id: "
+              f"{invocations[0]}")
+        check(f"--served-model-name {known_good_id}" in invocations[1],
+              f"the restore did not serve KNOWN_GOOD_PROFILE's own id — it "
+              f"may have inherited the failed attempt's profile instead: "
+              f"{invocations[1]}")
+        check(f"--served-model-name {attempt_id}" not in invocations[1],
+              f"the restore served the FAILED profile's id: {invocations[1]}")
+        check(out.returncode == RC_RESTORE_FAILED,
+              f"expected rc {RC_RESTORE_FAILED}, got {out.returncode}: "
+              f"{out.stderr!r}")
+    finally:
+        path = home / ".local" / "state" / "dsh-serve" / "state.json"
+        stale = json.loads(path.read_text()) if path.exists() else {}
+        for pid in (stale.get("vllm_pgid"), stale.get("supervisor_pid")):
+            if not pid:
+                continue
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+
+
 CASES = {
     "argv": case_argv,
     "uds-restore": case_restore_hardcodes_uds,
+    "restore-ignores-failed-profile": case_restore_ignores_the_failed_profile,
     "proxy-stream": case_proxy_streams,
     "proxy-death": case_proxy_death_refuses,
     "proxy-lifecycle": case_proxy_never_outlives_server,
@@ -3577,6 +3772,7 @@ CASES = {
     "stop-vram": case_stop_requires_vram_return,
     "no-release": case_refuses_to_release,
     "kv-pool": case_kv_pool_coherence,
+    "settings-context-window": case_settings_context_window,
     "pgroup": case_pgroup,
     "stop-mid-start": case_stop_mid_start,
     "already-running": case_already_running,
@@ -3750,6 +3946,11 @@ def main() -> int:
                            default=VRAM_RETURN_TIMEOUT_S)
     supervise.add_argument("--arbitrated", action="store_true")
     supervise.add_argument("--uds")
+    supervise.add_argument("--profile", required=True,
+                           help="the register profile name `start` resolved, "
+                                "recorded verbatim in state.json's `profile` "
+                                "field so it does not go stale once the "
+                                "phase flips to serving")
     supervise.add_argument("vllm_args", nargs="*")
     supervise.set_defaults(func=cmd_supervise)
 
