@@ -163,10 +163,12 @@ interface AgentOptions {
   model?: string
   /** Maximum output tokens for each conversation-model request. */
   maxTokens?: number
+  /** Model-hidden local scheduling intent applied to every conversation request. */
+  scheduling?: RequestScheduling
 }
 ```
 
-Dispatch requires `provider` and `model` after `agent/request`. When present, `maxTokens` must be a positive safe integer and caps every conversation-model request; omission allows the exact-model adapter default to materialize before the request header, or otherwise leaves provider behavior unchanged. An agent-scoped `deployment:persona` prompt section may shadow the global default persona.
+Dispatch requires `provider` and `model` after `agent/request`. When present, `maxTokens` must be a positive safe integer and caps every conversation-model request; omission allows the exact-model adapter default to materialize before the request header, or otherwise leaves provider behavior unchanged. Optional `scheduling` metadata accompanies each conversation request but is neither model-visible nor persisted in the request header. An agent-scoped `deployment:persona` prompt section may shadow the global default persona.
 
 The inbox is the delivery vocabulary — two ordered pending-message lists the agent owns as a durable projection:
 

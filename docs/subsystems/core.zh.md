@@ -167,10 +167,12 @@ interface AgentOptions {
   model?: string
   /** Maximum output tokens for each conversation-model request. */
   maxTokens?: number
+  /** Model-hidden local scheduling intent applied to every conversation request. */
+  scheduling?: RequestScheduling
 }
 ```
 
-在 `agent/request` 之后，分发要求 `provider` 与 `model` 都存在。提供 `maxTokens` 时，它必须是正安全整数，并限制每次对话模型请求的输出；省略时，系统会在写入请求 header 前填入确切模型的适配器默认值，否则提供方行为保持不变。agent 作用域的 `deployment:persona` 提示词段落可以遮蔽全局默认 persona。
+在 `agent/request` 之后，分发要求 `provider` 与 `model` 都存在。提供 `maxTokens` 时，它必须是正安全整数，并限制每次对话模型请求的输出；省略时，系统会在写入请求 header 前填入确切模型的适配器默认值，否则提供方行为保持不变。可选 `scheduling` 元数据会随每次对话请求传递，但对模型不可见，也不会持久化到 request header。agent 作用域的 `deployment:persona` 提示词段落可以遮蔽全局默认 persona。
 
 inbox 即投递词汇——agent 以持久投影形式拥有的两条有序待处理消息列表：
 

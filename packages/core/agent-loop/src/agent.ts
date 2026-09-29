@@ -507,6 +507,7 @@ export class ReactLoopAgent implements Agent {
       messages: boundaryMessages,
       ...header.system !== undefined ? { system: header.system } : {},
       ...header.tools !== undefined ? { tools: header.tools } : {},
+      ...this.options.scheduling === undefined ? {} : { scheduling: this.options.scheduling },
       sessionId: this.session.id,
       signal,
     }))

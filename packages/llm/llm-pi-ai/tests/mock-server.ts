@@ -55,6 +55,12 @@ export async function mockServer(script: {
         response.end(behavior.body ?? '{}')
         return
       }
+      if (behavior.body !== undefined) {
+        response.writeHead(200, { 'content-type': 'application/json', ...behavior.headers })
+        if (behavior.delayMs === undefined) response.end(behavior.body)
+        else setTimeout(() => response.end(behavior.body), behavior.delayMs)
+        return
+      }
       response.writeHead(200, { 'content-type': 'text/event-stream' })
       let index = 0
       const writeNext = (): void => {

@@ -337,6 +337,20 @@ export interface ToolSchema {
   parameters: Record<string, unknown>
 }
 
+/** Intent metadata for a local admission scheduler; never model-visible. */
+export interface RequestScheduling {
+  /** Relative service class selected by the request initiator. */
+  class: 'control' | 'interactive' | 'agent' | 'background'
+  /** Stable local fairness domain, such as one Fleet developer. */
+  tenant?: string
+  /** Bounded operator-facing reason for the class selection. */
+  purpose?: string
+  /** Opaque id used to correlate acquire and model requests. */
+  requestId?: string
+  /** Maximum admission-queue wait requested by the caller. */
+  deadlineMs?: number
+}
+
 /** A single model request, fully assembled. */
 export interface GenerateOptions {
   /** Registered provider route selecting the adapter instance. */
@@ -374,4 +388,6 @@ export interface GenerateOptions {
    * generation policy. Ordinary conversation requests leave it unset.
    */
   purpose?: 'compaction' | 'session-title'
+  /** Optional local scheduling intent; adapters must not send it to remote providers. */
+  scheduling?: RequestScheduling
 }

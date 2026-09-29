@@ -26,6 +26,7 @@
  * @module dsh-llm-pi-ai/adapter
  */
 
+import { randomUUID } from 'node:crypto'
 import { createModels, getSupportedThinkingLevels } from '@earendil-works/pi-ai'
 import type {
   Api,
@@ -46,7 +47,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import type {
-  GenerateOptions,
+  GenerateOptions, RequestScheduling,
   LlmModelInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
@@ -199,13 +200,97 @@ function reasoningInfo(
 }
 
 /** Merge deployment headers while removing case-insensitive attribution collisions. */
-function requestHeaders(headers: Readonly<Record<string, string>> | undefined): Record<string, string> {
+function schedulingHeaders(scheduling: RequestScheduling | undefined): Record<string, string> {
+  if (scheduling === undefined) return {}
+  return {
+    'X-Aivan-Work-Class': scheduling.class,
+    ...scheduling.tenant === undefined ? {} : { 'X-Aivan-Tenant': scheduling.tenant },
+    ...scheduling.purpose === undefined ? {} : { 'X-Aivan-Purpose': scheduling.purpose },
+    ...scheduling.requestId === undefined ? {} : { 'X-Aivan-Request-Id': scheduling.requestId },
+    ...scheduling.deadlineMs === undefined ? {} : { 'X-Aivan-Queue-Deadline-Ms': String(scheduling.deadlineMs) },
+  }
+}
+
+/** Derive conservative scheduling intent for auxiliary calls whose purpose is already explicit. */
+function auxiliaryScheduling(options: GenerateOptions): RequestScheduling | undefined {
+  if (options.scheduling !== undefined) return options.scheduling
+  if (options.purpose === 'session-title') return { class: 'background', purpose: 'session-title' }
+  if (options.purpose === 'compaction') return { class: 'agent', purpose: 'compaction' }
+  if (options.sessionId !== undefined) {
+    return { class: 'agent', tenant: String(options.sessionId), purpose: 'agent-turn' }
+  }
+  return undefined
+}
+
+/** Merge deployment, scheduling, and attribution headers in ownership order. */
+function requestHeaders(
+  headers: Readonly<Record<string, string>> | undefined,
+  scheduling: RequestScheduling | undefined,
+  permit?: string,
+): Record<string, string> {
   const attribution = attributionHeaders()
-  const reserved = new Set(Object.keys(attribution).map(name => name.toLowerCase()))
+  const scheduler = schedulingHeaders(scheduling)
+  const reserved = new Set([...Object.keys(attribution), ...Object.keys(scheduler)]
+    .map(name => name.toLowerCase()))
   return {
     ...Object.fromEntries(Object.entries(headers ?? {}).filter(([name]) => !reserved.has(name.toLowerCase()))),
+    ...scheduler,
+    ...permit === undefined ? {} : { 'X-Aivan-Admission': permit },
     ...attribution,
   }
+}
+
+interface AdmissionResponse {
+  permit: string
+  expiresInMs: number
+  queueWaitMs: number
+}
+
+/** Acquire one single-use local admission permit before provider timing starts. */
+async function acquirePermit(
+  baseURL: string,
+  scheduling: RequestScheduling,
+  maxTokens: number | undefined,
+  signal: AbortSignal | undefined,
+): Promise<{ permit: string; scheduling: RequestScheduling }> {
+  const requestId = scheduling.requestId ?? randomUUID()
+  const resolved = { ...scheduling, requestId }
+  let response: Response
+  try {
+    response = await fetch(new URL('/_aivan/admission/acquire', baseURL), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        requestId,
+        class: resolved.class,
+        ...resolved.tenant === undefined ? {} : { tenant: resolved.tenant },
+        ...resolved.purpose === undefined ? {} : { purpose: resolved.purpose },
+        ...maxTokens === undefined ? {} : { requestedOutputTokens: maxTokens },
+        ...resolved.deadlineMs === undefined ? {} : { deadlineMs: resolved.deadlineMs },
+      }),
+      ...signal === undefined ? {} : { signal },
+    })
+  } catch (error) {
+    if (signal?.aborted === true) {
+      throw new LlmError('local admission acquire aborted by caller', 'ABORTED', { cause: error })
+    }
+    throw new LlmError('local admission acquire transport failed', 'ADMISSION_TRANSPORT', { cause: error })
+  }
+  const payload: unknown = await response.json().catch(() => undefined)
+  if (!response.ok) {
+    const failure = payload as { error?: { code?: unknown; message?: unknown } } | undefined
+    const code = typeof failure?.error?.code === 'string' ? failure.error.code : 'ADMISSION_OVERLOAD'
+    const message = typeof failure?.error?.message === 'string'
+      ? failure.error.message
+      : `local admission refused with HTTP ${response.status}`
+    throw new LlmError(message, code, { status: response.status })
+  }
+  const permit = payload as Partial<AdmissionResponse> | undefined
+  if (typeof permit?.permit !== 'string' || permit.permit.length === 0
+    || !Number.isInteger(permit.expiresInMs) || !Number.isFinite(permit.queueWaitMs)) {
+    throw new LlmError('local admission returned an invalid permit', 'ADMISSION_PROTOCOL')
+  }
+  return { permit: permit.permit, scheduling: resolved }
 }
 
 /**
@@ -338,14 +423,11 @@ export class PiAiAdapter extends LlmAdapter {
       options.reasoningEffort ?? profile.reasoning,
     )
     const apiKey = await this.config.resolveApiKey(options.provider, profile)
-
+    const scheduling = profile.schedulingHeaders === true ? auxiliaryScheduling(options) : undefined
     const consumer = new AbortController()
     const upstream = options.signal === undefined
       ? consumer.signal
       : AbortSignal.any([options.signal, consumer.signal])
-    const streamIdleTimeoutMs = profile.streamIdleTimeoutMs
-    using watchdog = idleWatchdog(upstream, streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')
-
     try {
       const containsImage = options.messages.some(message => contentHasImage(message.content))
       if (containsImage && !model.input.includes('image')) {
@@ -360,47 +442,69 @@ export class PiAiAdapter extends LlmAdapter {
       }
       const context = attachments === undefined
         ? toPiContext(options, undefined, onReplayDegrade)
-        : await toPiContext({ ...options, signal: watchdog.signal }, attachments, onReplayDegrade, profile.maxRequestImageBytes, {
+        : await toPiContext({ ...options, signal: upstream }, attachments, onReplayDegrade, profile.maxRequestImageBytes, {
           maxPixels: profile.requestImagePixelBudget,
           maxBytes: profile.requestImageMaxBytes,
         })
-      const events = snapshot.models.streamSimple(model, context, {
-        ...profileOptions(profile, reasoning, apiKey),
-        ...options.temperature === undefined ? {} : { temperature: options.temperature },
-        ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
-        ...options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) },
-        signal: watchdog.signal,
-        // Profile headers are deployment-owned; attribution names are
-        // Harness-owned and therefore win collisions.
-        headers: requestHeaders(profile.headers),
-      })
-      const iterator = toStreamChunks(events, model.contextWindow)[Symbol.asyncIterator]()
-      let exhausted = false
+      // Acquire after local request materialization so the five-second permit
+      // lifetime covers only the immediate handoff to the provider request.
+      let admission: { permit: string; scheduling: RequestScheduling } | undefined
+      if (profile.admission === true && scheduling !== undefined) {
+        if (profile.baseURL === undefined) {
+          throw new LlmError('local admission requires an explicit provider baseURL', 'ADMISSION_CONFIG')
+        }
+        admission = await acquirePermit(profile.baseURL, scheduling, options.maxTokens, upstream)
+      }
+      const streamIdleTimeoutMs = profile.streamIdleTimeoutMs
+      using watchdog = idleWatchdog(upstream, streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')
+
       try {
-        while (true) {
-          const result = await watchdog.next(iterator)
-          const timeout = timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT')
-          if (timeout !== undefined) throw timeout
-          if (result.done) {
-            exhausted = true
-            return
+        const events = snapshot.models.streamSimple(model, context, {
+          ...profileOptions(profile, reasoning, apiKey),
+          ...options.temperature === undefined ? {} : { temperature: options.temperature },
+          ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+          ...options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) },
+          signal: watchdog.signal,
+          // Profile headers are deployment-owned; attribution names are
+          // Harness-owned and therefore win collisions.
+          headers: requestHeaders(
+            profile.headers,
+            admission?.scheduling ?? scheduling,
+            admission?.permit,
+          ),
+        })
+        const iterator = toStreamChunks(events, model.contextWindow)[Symbol.asyncIterator]()
+        let exhausted = false
+        try {
+          while (true) {
+            const result = await watchdog.next(iterator)
+            const timeout = timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT')
+            if (timeout !== undefined) throw timeout
+            if (result.done) {
+              exhausted = true
+              return
+            }
+            yield result.value
           }
-          yield result.value
-        }
-      } finally {
-        if (!exhausted) {
-          consumer.abort('pi-ai stream consumer stopped')
-          try {
-            await iterator.return(undefined)
-          } catch (_abortedSdkTeardown) {
-            // The stable signal already owns SDK termination; return-time abort cannot add an outcome.
+        } finally {
+          if (!exhausted) {
+            consumer.abort('pi-ai stream consumer stopped')
+            try {
+              await iterator.return(undefined)
+            } catch (_abortedSdkTeardown) {
+              // The stable signal already owns SDK termination; return-time abort cannot add an outcome.
+            }
           }
         }
+      } catch (error: unknown) {
+        if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
+          throw new LlmError(`pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
+        }
+        throw error
       }
     } catch (error: unknown) {
-      if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
-        throw new LlmError(`pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
-      }
+      // Caller cancellation owns both local context materialization/admission
+      // and provider streaming, including failures concurrent with the abort.
       if (options.signal?.aborted) {
         throw new LlmError('pi-ai request aborted by caller', 'ABORTED', { cause: error })
       }

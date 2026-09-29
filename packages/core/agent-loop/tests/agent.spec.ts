@@ -26,6 +26,28 @@ function send(agent: Agent, text: string): void {
 }
 
 describe('Agent', () => {
+  it('carries model-hidden scheduling intent on each loop request', async () => {
+    const adapter = new MockAdapter([textResponse('ok')])
+    const ctx = await harness(adapter)
+    const scheduling = {
+      class: 'interactive' as const,
+      tenant: 'fleet-fe',
+      purpose: 'operator-turn',
+      requestId: 'request-1',
+      deadlineMs: 120_000,
+    }
+    const agent = ctx.agentLoop.create(SessionId('scheduled'), {
+      provider: 'mock', model: 'mock', scheduling,
+    })
+
+    send(agent, 'hello')
+    await agent.whenIdle()
+
+    expect(adapter.requests).toHaveLength(1)
+    expect(adapter.requests[0]?.scheduling).toEqual(scheduling)
+    expect(agent.session.events.some(event => JSON.stringify(event).includes('fleet-fe'))).toBe(false)
+  })
+
   it('idle inject() durably stages context without opening a turn', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)

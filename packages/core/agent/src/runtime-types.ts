@@ -7,7 +7,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
-import type { LlmCallConfig, LlmFailure, ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm'
+import type { LlmCallConfig, LlmFailure, RequestScheduling, ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type { AgentCancelCause, Session, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 export type { AgentCancelCause } from '@deepseek-ai/dsh-session'
 import type { Inbox } from './inbox.ts'
@@ -28,6 +28,8 @@ export interface AgentOptions {
   model?: string
   /** Maximum output tokens for each conversation-model request. */
   maxTokens?: number
+  /** Model-hidden local scheduling intent applied to every conversation request. */
+  scheduling?: RequestScheduling
 }
 
 /** Options for {@link Agent.cancel}. */

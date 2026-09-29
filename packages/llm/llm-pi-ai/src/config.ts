@@ -146,6 +146,10 @@ export interface PiAiProviderProfile {
   defaultInput?: PiAiModality[]
   /** Provider request headers; Harness attribution wins reserved names. */
   headers?: Record<string, string>
+  /** Map provider-neutral scheduling metadata to local proxy headers. */
+  schedulingHeaders?: boolean
+  /** Acquire a local proxy permit before starting the provider stream idle clock. */
+  admission?: boolean
   /** Provider-neutral pi-ai reasoning level. */
   reasoning?: ModelThinkingLevel
   /** Token budgets used by reasoning providers that support them. */
@@ -316,6 +320,8 @@ const profile = z.object({
   defaultMaxTokens: z.number().step(1).min(1).default(DEFAULT_MAX_TOKENS),
   defaultInput: z.array(z.union(MODALITIES)).default([...DEFAULT_INPUT]),
   headers: z.dict(z.string()),
+  schedulingHeaders: z.boolean(),
+  admission: z.boolean(),
   reasoning: z.union(THINKING_LEVELS),
   thinkingBudgets,
   cacheRetention: z.union(['none', 'short', 'long']),
@@ -392,6 +398,23 @@ export function resolveProfiles(
     }
     if (source.displayName !== undefined && source.displayName.length === 0) {
       throw new Error(`llm-pi-ai: provider "${provider}" has an empty displayName`)
+    }
+    if (source.admission === true) {
+      if (source.schedulingHeaders !== true) {
+        throw new Error(`llm-pi-ai: provider "${provider}" admission requires schedulingHeaders: true`)
+      }
+      if (source.baseURL === undefined) {
+        throw new Error(`llm-pi-ai: provider "${provider}" admission requires an explicit loopback baseURL`)
+      }
+      let endpoint: URL
+      try {
+        endpoint = new URL(source.baseURL)
+      } catch {
+        throw new Error(`llm-pi-ai: provider "${provider}" admission baseURL is invalid`)
+      }
+      if (endpoint.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname)) {
+        throw new Error(`llm-pi-ai: provider "${provider}" admission requires a loopback HTTP baseURL`)
+      }
     }
     const streamIdleTimeoutMs = source.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS
     if (!Number.isFinite(streamIdleTimeoutMs)

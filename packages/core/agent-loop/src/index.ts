@@ -305,6 +305,13 @@ export class AgentLoop extends Service implements AgentFactory {
       provider: z.string(),
       model: z.string(),
       maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER),
+      scheduling: z.object({
+        class: z.union(['control', 'interactive', 'agent', 'background']).required(),
+        tenant: z.string(),
+        purpose: z.string(),
+        requestId: z.string(),
+        deadlineMs: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER),
+      }),
       cwd: z.string(),
       resumeSessionId: z.string(),
     })).default([]),

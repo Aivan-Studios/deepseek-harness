@@ -503,6 +503,22 @@ interface LlmResolvedModelInfo extends LlmModelInfo {
 ```
 
 ```ts type-equiv
+/** Intent metadata for a local admission scheduler; never model-visible. */
+interface RequestScheduling {
+  /** Relative service class selected by the request initiator. */
+  class: 'control' | 'interactive' | 'agent' | 'background'
+  /** Stable local fairness domain, such as one Fleet developer. */
+  tenant?: string
+  /** Bounded operator-facing reason for the class selection. */
+  purpose?: string
+  /** Opaque id used to correlate acquire and model requests. */
+  requestId?: string
+  /** Maximum admission-queue wait requested by the caller. */
+  deadlineMs?: number
+}
+```
+
+```ts type-equiv
 /** A single model request, fully assembled. */
 interface GenerateOptions {
   /** Registered provider route selecting the adapter instance. */
@@ -540,6 +556,8 @@ interface GenerateOptions {
    * generation policy. Ordinary conversation requests leave it unset.
    */
   purpose?: 'compaction' | 'session-title'
+  /** Optional local scheduling intent; adapters must not send it to remote providers. */
+  scheduling?: RequestScheduling
 }
 ```
 

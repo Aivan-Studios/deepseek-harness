@@ -77,11 +77,13 @@ import argparse
 import asyncio
 import base64
 import fcntl
+import hashlib
 import http.client
 import json
 import os
 import pwd
 import re
+import secrets
 import struct
 import shutil
 import signal
@@ -1217,6 +1219,33 @@ PROXY_CHUNK = 65536
 PROXY_UPSTREAM_CONNECT_S = 5.0
 PROXY_BACKLOG = 2048
 PROXY_BIND_TIMEOUT_S = 15.0    # a fresh interpreter parsing this file, no more
+PROXY_REQUEST_TIMEOUT_S = 60.0  # head + body from a live loopback client; an idle or half-open one dies here
+PROXY_SHADOW_MAX_ACTIVE = 2
+PROXY_MAX_QUEUED = 64
+PROXY_MAX_QUEUED_PER_TENANT = 8
+PROXY_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+PROXY_MAX_QUEUED_BODY_BYTES = 64 * 1024 * 1024
+PROXY_PERMIT_TTL_S = 5.0
+PROXY_QUEUE_DEADLINES_MS = {
+    "control": 30_000,
+    "interactive": 120_000,
+    "agent": 240_000,
+    "background": 600_000,
+}
+PROXY_WORK_CLASSES = ("control", "interactive", "agent", "background")
+PROXY_METADATA_MAX_CHARS = 128
+PROXY_SCHEDULING_HEADERS = {
+    "x-aivan-work-class", "x-aivan-tenant", "x-aivan-purpose",
+    "x-aivan-request-id", "x-aivan-queue-deadline-ms",
+    "x-aivan-admission",
+}
+# The auto-mode permission classifier, by the unique first line of the system
+# prompt the harness gives it. Other harness blocks may precede that prompt in
+# the request. Its verdict must land inside the client's ~61 s
+# deadline, so the proxy turns thinking off for it (see
+# `rewrite_thinking_off`) — the only traffic that loses reasoning at the relay.
+PROXY_CLASSIFIER_PREFIX = (
+    "You are a security monitor for autonomous AI coding agents")
 
 
 def uds_path() -> Path:
@@ -1253,8 +1282,443 @@ def prepare_uds(path: Path) -> str | None:
     return None
 
 
+def rewrite_thinking_off(path: str, body: bytes) -> tuple[bytes, str | None]:
+    """Merge enable_thinking:False into a body that must answer fast.
+
+    Returns (body, reason); reason is None when the body went through
+    untouched. The vLLM Anthropic adapter installed here silently drops the
+    `thinking` request parameter (no schema field; only chat_template_kwargs
+    is forwarded), and the Qwen template thinks by default. So a request
+    whose verdict must land inside the client's ~61 s deadline — the
+    harness's auto-mode permission classifier — or any client explicitly
+    asking for no thinking (`thinking.type == "disabled"`), gets the one knob
+    the template honours. Everything else is returned BYTE-IDENTICAL (no
+    re-serialisation): normal agent traffic keeps its reasoning, and bodies
+    that do not parse pass through rather than break.
+    """
+    if not path.startswith("/v1/messages"):
+        return body, None
+    try:
+        request = json.loads(body)
+    except (UnicodeDecodeError, ValueError):
+        return body, None
+    if not isinstance(request, dict):
+        return body, None
+
+    system = request.get("system")
+    if isinstance(system, str):
+        system_text = system
+    elif isinstance(system, list):
+        system_text = "".join(block.get("text", "") for block in system
+                              if isinstance(block, dict))
+    else:
+        system_text = ""
+    is_classifier = PROXY_CLASSIFIER_PREFIX in system_text
+
+    thinking = request.get("thinking")
+    wants_disabled = (isinstance(thinking, dict)
+                      and thinking.get("type") == "disabled")
+    if not (is_classifier or wants_disabled):
+        return body, None
+
+    kwargs = request.get("chat_template_kwargs")
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+    if wants_disabled and not is_classifier \
+            and kwargs.get("enable_thinking") is True:
+        # The client drove the knob explicitly against its own thinking
+        # field — a contradiction this relay does not get to settle.
+        return body, None
+    kwargs["enable_thinking"] = False
+    request["chat_template_kwargs"] = kwargs
+    reason = ("auto-mode classifier request" if is_classifier
+              else 'thinking: "disabled"')
+    return json.dumps(request, ensure_ascii=False).encode("utf-8"), reason
+
+
+def header_fields(header_lines: list[str]) -> dict[str, str]:
+    """Return lower-case HTTP fields; later duplicates win for audit only."""
+    fields = {}
+    for line in header_lines:
+        key, sep, value = line.partition(":")
+        if sep:
+            fields[key.strip().lower()] = value.strip()
+    return fields
+
+
+def is_classifier_request(path: str, body: bytes) -> bool:
+    """Recognize the existing bounded Claude auto-mode classifier."""
+    if not path.startswith("/v1/messages"):
+        return False
+    try:
+        request = json.loads(body)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(request, dict):
+        return False
+    system = request.get("system")
+    if isinstance(system, str):
+        system_text = system
+    elif isinstance(system, list):
+        system_text = "".join(block.get("text", "") for block in system
+                              if isinstance(block, dict))
+    else:
+        system_text = ""
+    return PROXY_CLASSIFIER_PREFIX in system_text
+
+
+def shadow_metadata(path: str, header_lines: list[str], body: bytes) -> dict:
+    """Validate scheduling metadata and classify one inference request.
+
+    This computes Phase 1 policy input only. It neither delays nor rejects the
+    request. Unknown or malformed metadata downgrades to the safe legacy agent
+    class, and only a bounded tenant digest reaches logs.
+    """
+    fields = header_fields(header_lines)
+    supplied = {name: fields[name] for name in PROXY_SCHEDULING_HEADERS
+                if name in fields}
+    invalid = any(len(value) > PROXY_METADATA_MAX_CHARS
+                  or "\r" in value or "\n" in value
+                  for value in supplied.values())
+    claimed_class = supplied.get("x-aivan-work-class")
+    if claimed_class is not None and claimed_class not in PROXY_WORK_CLASSES:
+        invalid = True
+    deadline = supplied.get("x-aivan-queue-deadline-ms")
+    if deadline is not None:
+        try:
+            if int(deadline) <= 0:
+                invalid = True
+        except ValueError:
+            invalid = True
+
+    if is_classifier_request(path, body):
+        work_class = "control"
+        purpose = "permission-classifier"
+        source = "classifier"
+    elif invalid:
+        work_class = "agent"
+        purpose = "invalid-metadata"
+        source = "downgraded"
+    elif claimed_class is not None:
+        work_class = claimed_class
+        purpose = supplied.get("x-aivan-purpose", "unspecified")
+        source = "explicit"
+    else:
+        work_class = "agent"
+        purpose = "unspecified"
+        source = "legacy"
+
+    tenant = supplied.get("x-aivan-tenant", "legacy")
+    if invalid:
+        tenant = "legacy"
+    tenant_digest = hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:12]
+    return {"class": work_class, "purpose": purpose[:PROXY_METADATA_MAX_CHARS],
+            "source": source, "tenant": tenant_digest,
+            "tenant_raw": tenant,
+            "request_id": supplied.get("x-aivan-request-id"),
+            "deadline_ms": (int(deadline) if deadline is not None and not invalid
+                            else PROXY_QUEUE_DEADLINES_MS[work_class]),
+            "invalid": invalid}
+
+
+class AdmissionOverload(Exception):
+    """A bounded local admission queue refused or expired one request."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class AdmissionController:
+    """Phase 2 permits and background-only admission.
+
+    Non-background work remains pass-through while participating in the active
+    count. Background work waits for the measured two-request capacity and a
+    one-active-per-tenant bound. Phase 3 replaces this FIFO condition with the
+    weighted scheduler after lifecycle behavior is proven.
+    """
+
+    def __init__(self) -> None:
+        self.condition = asyncio.Condition()
+        self.active = 0
+        self.background_by_tenant: dict[str, int] = {}
+        self.queued = 0
+        self.queued_by_tenant: dict[str, int] = {}
+        self.queued_body_bytes = 0
+        self.permits: dict[str, tuple[dict, asyncio.Task]] = {}
+
+    def _can_enter(self, metadata: dict) -> bool:
+        if metadata["class"] != "background":
+            return True
+        tenant = metadata["tenant_raw"]
+        return (self.active < PROXY_SHADOW_MAX_ACTIVE
+                and self.background_by_tenant.get(tenant, 0) < 1)
+
+    def _occupy(self, metadata: dict) -> None:
+        self.active += 1
+        if metadata["class"] == "background":
+            tenant = metadata["tenant_raw"]
+            self.background_by_tenant[tenant] = \
+                self.background_by_tenant.get(tenant, 0) + 1
+
+    def _release(self, metadata: dict) -> None:
+        self.active = max(0, self.active - 1)
+        if metadata["class"] == "background":
+            tenant = metadata["tenant_raw"]
+            remaining = self.background_by_tenant.get(tenant, 0) - 1
+            if remaining > 0:
+                self.background_by_tenant[tenant] = remaining
+            else:
+                self.background_by_tenant.pop(tenant, None)
+
+    async def enter(self, metadata: dict, body_bytes: int = 0) -> float:
+        """Wait if this is background work, then occupy one active slot."""
+        started = time.monotonic()
+        tenant = metadata["tenant_raw"]
+        timeout = min(metadata["deadline_ms"],
+                      PROXY_QUEUE_DEADLINES_MS[metadata["class"]]) / 1000
+        async with self.condition:
+            if not self._can_enter(metadata):
+                if (self.queued >= PROXY_MAX_QUEUED
+                        or self.queued_by_tenant.get(tenant, 0)
+                        >= PROXY_MAX_QUEUED_PER_TENANT
+                        or self.queued_body_bytes + body_bytes
+                        > PROXY_MAX_QUEUED_BODY_BYTES):
+                    raise AdmissionOverload("ADMISSION_QUEUE_FULL",
+                                            "local inference queue is full")
+                self.queued += 1
+                self.queued_body_bytes += body_bytes
+                self.queued_by_tenant[tenant] = \
+                    self.queued_by_tenant.get(tenant, 0) + 1
+                try:
+                    await asyncio.wait_for(
+                        self.condition.wait_for(lambda: self._can_enter(metadata)),
+                        timeout)
+                except asyncio.TimeoutError as error:
+                    raise AdmissionOverload(
+                        "ADMISSION_DEADLINE_EXCEEDED",
+                        "local inference queue deadline expired") from error
+                finally:
+                    self.queued -= 1
+                    self.queued_body_bytes -= body_bytes
+                    remaining = self.queued_by_tenant.get(tenant, 0) - 1
+                    if remaining > 0:
+                        self.queued_by_tenant[tenant] = remaining
+                    else:
+                        self.queued_by_tenant.pop(tenant, None)
+            self._occupy(metadata)
+        return (time.monotonic() - started) * 1000
+
+    async def release(self, metadata: dict) -> None:
+        """Release one active or reserved slot and wake queued background work."""
+        async with self.condition:
+            self._release(metadata)
+            self.condition.notify_all()
+
+    async def reserve(self, metadata: dict) -> tuple[str, float]:
+        """Acquire a single-use permit whose reservation expires quickly."""
+        waited = await self.enter(metadata)
+        expiry = None
+        try:
+            token = secrets.token_urlsafe(32)
+            expiry = asyncio.create_task(self._expire(token))
+            async with self.condition:
+                self.permits[token] = (metadata, expiry)
+            return token, waited
+        except BaseException:
+            # Cancellation can arrive after enter() occupies the slot but
+            # before the permit becomes visible. Never strand that capacity.
+            if expiry is not None:
+                expiry.cancel()
+            await self.release(metadata)
+            raise
+
+    async def _expire(self, token: str) -> None:
+        await asyncio.sleep(PROXY_PERMIT_TTL_S)
+        async with self.condition:
+            permit = self.permits.pop(token, None)
+            if permit is not None:
+                self._release(permit[0])
+                self.condition.notify_all()
+
+    async def consume(self, token: str, metadata: dict) -> dict:
+        """Consume a permit only when its bound scheduling identity matches."""
+        async with self.condition:
+            permit = self.permits.get(token)
+            if permit is None:
+                raise AdmissionOverload("ADMISSION_PERMIT_INVALID",
+                                        "admission permit is absent, expired, or consumed")
+            reserved, expiry = permit
+            fields = ("class", "tenant_raw", "request_id")
+            if any(reserved[field] != metadata[field] for field in fields):
+                raise AdmissionOverload("ADMISSION_PERMIT_MISMATCH",
+                                        "admission permit does not match the model request")
+            self.permits.pop(token)
+            expiry.cancel()
+            return reserved
+
+    async def revoke(self, token: str) -> None:
+        """Release an unconsumed permit after its acquire client disappears."""
+        async with self.condition:
+            permit = self.permits.pop(token, None)
+            if permit is not None:
+                permit[1].cancel()
+                self._release(permit[0])
+                self.condition.notify_all()
+
+
+async def read_http_request(reader) -> tuple[str, str, list[str], bytes]:
+    """Read exactly one HTTP request: request line, headers, and body.
+
+    Raises asyncio.IncompleteReadError (or ValueError) if the peer goes quiet
+    mid-request; the caller closes the connection — half-consumed bytes
+    cannot be relayed.
+    """
+    head = await reader.readuntil(b"\r\n\r\n")
+    lines = head[:-4].decode("latin-1").split("\r\n")
+    request_line, header_lines = lines[0], lines[1:]
+    method, path, _version = request_line.split(" ", 2)
+
+    fields: dict[str, str] = {}
+    for line in header_lines:
+        key, sep, value = line.partition(":")
+        if sep:
+            fields[key.strip().lower()] = value.strip()
+
+    body = b""
+    if "chunked" in fields.get("transfer-encoding", "").lower():
+        while True:
+            size_line = await reader.readuntil(b"\r\n")
+            size = int(size_line.split(b";")[0] or b"0", 16)
+            if size == 0:
+                while True:                     # trailers end at the blank line
+                    if await reader.readuntil(b"\r\n") == b"\r\n":
+                        break
+                break
+            if size < 0 or len(body) + size > PROXY_MAX_REQUEST_BODY_BYTES:
+                raise ValueError("request body exceeds proxy limit")
+            body += await reader.readexactly(size)
+            if await reader.readexactly(2) != b"\r\n":
+                raise ValueError("chunk data has no CRLF terminator")
+    elif "content-length" in fields:
+        length = int(fields["content-length"])
+        if length < 0 or length > PROXY_MAX_REQUEST_BODY_BYTES:
+            raise ValueError("request body exceeds proxy limit")
+        body = await reader.readexactly(length)
+    return method, path, header_lines, body
+
+
+def build_request_head(method: str, path: str,
+                       header_lines: list[str], body: bytes) -> bytes:
+    """Reframe the head for the forwarded body.
+
+    Content-Length is replaced (the rewrite may have changed the size), and
+    `Connection: close` is imposed: each client connection then carries
+    exactly one exchange, so no side has to guess where the relayed response
+    ended — uvicorn mirrors the close on its response, and clients open a
+    fresh connection per request.
+    """
+    dropped = {"content-length", "transfer-encoding", "connection",
+               *PROXY_SCHEDULING_HEADERS}
+    kept = [line for line in header_lines
+            if not line or ":" not in line
+            or line.split(":", 1)[0].strip().lower() not in dropped]
+    kept.append(f"Content-Length: {len(body)}")
+    kept.append("Connection: close")
+    return (f"{method} {path} HTTP/1.1\r\n"
+            + "\r\n".join(kept) + "\r\n\r\n").encode("latin-1")
+
+
+def is_inference_request(method: str, path: str) -> bool:
+    """Return whether a request consumes a vLLM generation slot.
+
+    Anthropic token counting shares the `/v1/messages` prefix but performs no
+    generation. Counting it against admission capacity creates false queue
+    decisions precisely when a client fans out context accounting requests.
+    """
+    endpoint = path.partition("?")[0]
+    return method == "POST" and endpoint in {
+        "/v1/messages", "/v1/chat/completions", "/v1/completions",
+    }
+
+
+def acquire_metadata(body: bytes) -> dict:
+    """Validate one DSH-aware permit request into proxy scheduling metadata."""
+    try:
+        request = json.loads(body)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ValueError("admission acquire body must be JSON") from error
+    if not isinstance(request, dict):
+        raise ValueError("admission acquire body must be an object")
+    work_class = request.get("class")
+    if work_class not in PROXY_WORK_CLASSES:
+        raise ValueError("admission acquire class is invalid")
+    request_id = request.get("requestId")
+    tenant = request.get("tenant", "legacy")
+    purpose = request.get("purpose", "unspecified")
+    for name, value in (("requestId", request_id), ("tenant", tenant),
+                        ("purpose", purpose)):
+        if value is not None and (not isinstance(value, str)
+                                  or len(value) > PROXY_METADATA_MAX_CHARS
+                                  or "\r" in value or "\n" in value):
+            raise ValueError(f"admission acquire {name} is invalid")
+    deadline = request.get("deadlineMs",
+                           PROXY_QUEUE_DEADLINES_MS[work_class])
+    if not isinstance(deadline, int) or isinstance(deadline, bool) or deadline <= 0:
+        raise ValueError("admission acquire deadlineMs is invalid")
+    tenant_digest = hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:12]
+    return {"class": work_class, "purpose": purpose,
+            "source": "acquire", "tenant": tenant_digest,
+            "tenant_raw": tenant, "request_id": request_id,
+            "deadline_ms": deadline, "invalid": False}
+
+
+async def proxy_json(writer, status: int, payload: dict) -> None:
+    """Write one bounded JSON response and close its loopback connection."""
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    reasons = {200: "OK", 400: "Bad Request", 409: "Conflict",
+               429: "Too Many Requests"}
+    head = (
+        f"HTTP/1.1 {status} {reasons[status]}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n").encode("latin-1")
+    writer.write(head + body)
+    try:
+        await writer.drain()
+    finally:
+        writer.close()
+
+
+async def while_client_connected(operation, reader):
+    """Await admission while cancelling it promptly when the client closes."""
+    pending = asyncio.create_task(operation)
+    disconnected = asyncio.create_task(reader.read(1))
+    done, _ = await asyncio.wait(
+        {pending, disconnected}, return_when=asyncio.FIRST_COMPLETED)
+    if pending in done:
+        disconnected.cancel()
+        try:
+            await disconnected
+        except asyncio.CancelledError:
+            pass
+        return await pending
+    pending.cancel()
+    try:
+        await pending
+    except asyncio.CancelledError:
+        pass
+    return None
+
+
 async def proxy_serve(listen_port: int, uds: str) -> None:
-    """Relay 127.0.0.1:listen_port to the Unix socket, streaming both ways."""
+    """Relay 127.0.0.1:listen_port to the Unix socket.
+
+    Responses are byte-for-byte streamed (a token stream must reach the
+    client as it is produced). Requests are read whole first, because the one
+    rewrite this proxy makes — thinking off for the auto-mode classifier and
+    for explicit thinking:disabled — needs the JSON body.
+    """
     async def pump(reader, writer) -> None:
         try:
             while True:
@@ -1275,20 +1739,131 @@ async def proxy_serve(listen_port: int, uds: str) -> None:
             except OSError:
                 pass
 
+    shadow_active = 0
+    admission = AdmissionController()
+
     async def handle(client_reader, client_writer) -> None:
+        nonlocal shadow_active
+        tracked = False
+        admission_metadata = None
         try:
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(uds), PROXY_UPSTREAM_CONNECT_S)
-        except (OSError, asyncio.TimeoutError):
-            # vLLM is not up yet, or has gone. Close immediately: hanging here
-            # would reproduce the exact symptom this proxy exists to avoid.
+            method, path, header_lines, body = await asyncio.wait_for(
+                read_http_request(client_reader), PROXY_REQUEST_TIMEOUT_S)
+            if method == "POST" and path.partition("?")[0] \
+                    == "/_aivan/admission/acquire":
+                try:
+                    metadata = acquire_metadata(body)
+                    acquired = await while_client_connected(
+                        admission.reserve(metadata), client_reader)
+                    if acquired is None:
+                        return
+                    permit, waited = acquired
+                    say("proxy: admission phase2 "
+                        f"action=reserve class={metadata['class']} "
+                        f"purpose={metadata['purpose']} source=acquire "
+                        f"tenant={metadata['tenant']} active={admission.active} "
+                        f"queue_wait_ms={round(waited)}")
+                except ValueError as error:
+                    await proxy_json(client_writer, 400, {
+                        "error": {"code": "ADMISSION_INVALID_REQUEST",
+                                  "message": str(error)}})
+                    return
+                except AdmissionOverload as error:
+                    await proxy_json(client_writer, 429, {
+                        "error": {"code": error.code,
+                                  "message": str(error)}})
+                    return
+                try:
+                    await proxy_json(client_writer, 200, {
+                        "permit": permit,
+                        "expiresInMs": int(PROXY_PERMIT_TTL_S * 1000),
+                        "queueWaitMs": round(waited),
+                    })
+                except (ConnectionError, OSError):
+                    await admission.revoke(permit)
+                return
+            inference = is_inference_request(method, path)
+            if inference:
+                metadata = shadow_metadata(path, header_lines, body)
+                decision = ("would-admit" if shadow_active < PROXY_SHADOW_MAX_ACTIVE
+                            else "would-queue")
+                shadow_active += 1
+                tracked = True
+                say("proxy: admission shadow "
+                    f"decision={decision} class={metadata['class']} "
+                    f"purpose={metadata['purpose']} source={metadata['source']} "
+                    f"tenant={metadata['tenant']} active={shadow_active}")
+                permit = header_fields(header_lines).get("x-aivan-admission")
+                admission_path = "compat"
+                try:
+                    if permit is None:
+                        waited = await while_client_connected(
+                            admission.enter(metadata, len(body)), client_reader)
+                        if waited is None:
+                            shadow_active -= 1
+                            tracked = False
+                            return
+                        admission_metadata = metadata
+                    else:
+                        admission_metadata = await admission.consume(permit, metadata)
+                        waited = 0.0
+                        admission_path = "permit"
+                except AdmissionOverload as error:
+                    shadow_active -= 1
+                    tracked = False
+                    await proxy_json(client_writer, 429, {
+                        "error": {"code": error.code,
+                                  "message": str(error)}})
+                    return
+                say("proxy: admission phase2 "
+                    f"action=admit class={metadata['class']} "
+                    f"purpose={metadata['purpose']} source={metadata['source']} "
+                    f"tenant={metadata['tenant']} active={admission.active} "
+                    f"queue_wait_ms={round(waited)} path={admission_path}")
+            body, reason = rewrite_thinking_off(path, body)
+            if reason:
+                say(f"proxy: thinking off for {path} ({reason})")
+            request = build_request_head(method, path, header_lines, body) + body
+        except (OSError, EOFError, ValueError, asyncio.TimeoutError):
+            # A half-read request cannot be relayed; closing looks exactly
+            # like a dead server, which is what consumers must never hang on.
+            if tracked:
+                shadow_active -= 1
+                tracked = False
             try:
                 client_writer.close()
             except OSError:
                 pass
             return
-        await asyncio.gather(pump(client_reader, upstream_writer),
-                             pump(upstream_reader, client_writer))
+        try:
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(uds), PROXY_UPSTREAM_CONNECT_S)
+            except (OSError, asyncio.TimeoutError):
+                # vLLM is not up yet, or has gone. Close immediately: hanging here
+                # would reproduce the exact symptom this proxy exists to avoid.
+                try:
+                    client_writer.close()
+                except OSError:
+                    pass
+                return
+            try:
+                upstream_writer.write(request)
+                await upstream_writer.drain()
+            except OSError:
+                # Upstream died between connect and write; same remedy as above.
+                try:
+                    client_writer.close()
+                except OSError:
+                    pass
+                return
+            await asyncio.gather(pump(client_reader, upstream_writer),
+                                 pump(upstream_reader, client_writer))
+        finally:
+            if tracked:
+                shadow_active -= 1
+            if admission_metadata is not None:
+                await admission.release(admission_metadata)
 
     server = await asyncio.start_server(handle, HOST, listen_port,
                                         backlog=PROXY_BACKLOG)
@@ -3575,6 +4150,253 @@ def case_proxy_death_refuses(tmp: Path) -> None:
         probe.close()
 
 
+def case_proxy_thinking_rewrite(tmp: Path) -> None:
+    """The proxy must turn thinking off for the auto-mode classifier — and only there.
+
+    The vLLM Anthropic adapter drops the harness's `thinking` parameter, and
+    the Qwen template thinks by default: without this rewrite the classifier's
+    ~35k-token prompt burns its 61 s deadline in reasoning and every gated tool
+    call stalls with "temporarily unavailable (timed out)". Normal requests
+    must come through byte-identical.
+    """
+    import socket
+    import threading
+
+    uds = tmp / "rewrite.sock"
+    seen: list[bytes] = []
+    seen_request_lines: list[str] = []
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(uds))
+    listener.listen(8)
+
+    def one(conn: socket.socket) -> None:
+        with conn:
+            try:
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    part = conn.recv(PROXY_CHUNK)
+                    if not part:
+                        return
+                    head += part
+                head_text, rest = head.split(b"\r\n\r\n", 1)
+                lines = head_text.decode("latin-1").split("\r\n")
+                seen_request_lines.append(lines[0])
+                length = 0
+                for line in lines[1:]:
+                    key, sep, value = line.partition(":")
+                    if sep and key.strip().lower() == "content-length":
+                        length = int(value)
+                body = rest
+                while len(body) < length:
+                    part = conn.recv(length - len(body))
+                    if not part:
+                        return
+                    body += part
+                seen.append(body)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                             b"Connection: close\r\n\r\nok")
+            except OSError:
+                return
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=one, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    port = free_port()
+    proxy = spawn_proxy(port, uds)
+    try:
+        def post(body: dict) -> bytes:
+            raw = json.dumps(body).encode("utf-8")
+            with socket.create_connection((HOST, int(port)), timeout=15) as client:
+                client.sendall(b"POST /v1/messages HTTP/1.1\r\n"
+                               b"Host: localhost\r\n"
+                               b"Content-Length: " + str(len(raw)).encode()
+                               + b"\r\n\r\n" + raw)
+                return client.recv(65536)
+
+        # 1. The classifier: system prompt carries the harness's signature.
+        response = post({"model": "Qwen3.8-27B", "max_tokens": 8,
+                         "system": [
+                             {"type": "text", "text": "harness prelude"},
+                             {"type": "text",
+                              "text": PROXY_CLASSIFIER_PREFIX + " ..."},
+                         ],
+                         "thinking": {"type": "adaptive"}})
+        check(b"ok" in response,
+              f"classifier request got no response: {response!r}")
+        check(seen_request_lines[0] == "POST /v1/messages HTTP/1.1",
+              f"request line was not forwarded: {seen_request_lines[0]!r}")
+        rewritten = json.loads(seen[0])
+        check(rewritten.get("chat_template_kwargs", {})
+              .get("enable_thinking") is False,
+              f"classifier request was not rewritten: {seen[0]!r}")
+
+        # 2. An explicit thinking:disabled outside the classifier.
+        post({"model": "Qwen3.8-27B", "system": "plain",
+              "thinking": {"type": "disabled"}})
+        check(json.loads(seen[1]).get("chat_template_kwargs", {})
+              .get("enable_thinking") is False,
+              f'thinking:"disabled" was not honoured: {seen[1]!r}')
+
+        # 3. Normal agent traffic: byte-identical, no knob injected.
+        plain = {"model": "Qwen3.8-27B", "system": "plain",
+                 "thinking": {"type": "adaptive"},
+                 "messages": [{"role": "user", "content": "hello"}]}
+        post(plain)
+        check(seen[2] == json.dumps(plain).encode("utf-8"),
+              f"an unmarked request was rewritten: {seen[2]!r}")
+    finally:
+        proxy.terminate()
+        proxy.wait(timeout=10)
+        listener.close()
+
+
+def case_proxy_admission_shadow(_tmp: Path) -> None:
+    """Shadow metadata is bounded, downgraded safely, and never forwarded."""
+    ordinary = json.dumps({"model": "Qwen3.8-27B",
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+    headers = ["Host: localhost", "X-Aivan-Work-Class: background",
+               "X-Aivan-Tenant: fleet-fe", "X-Aivan-Purpose: subagent",
+               "X-Aivan-Request-Id: opaque-1", "Content-Length: 12"]
+    metadata = shadow_metadata("/v1/chat/completions", headers, ordinary)
+    check(metadata["class"] == "background" and metadata["purpose"] == "subagent"
+          and metadata["source"] == "explicit" and not metadata["invalid"],
+          f"valid scheduling metadata was not retained in shadow: {metadata!r}")
+    check(metadata["tenant"] != "fleet-fe" and len(metadata["tenant"]) == 12,
+          f"raw tenant escaped into shadow metadata: {metadata!r}")
+    forwarded = build_request_head("POST", "/v1/chat/completions", headers, ordinary)
+    check(b"x-aivan-" not in forwarded.lower(),
+          f"scheduling headers reached the backend: {forwarded!r}")
+
+    invalid = shadow_metadata("/v1/chat/completions",
+                              ["X-Aivan-Work-Class: urgent",
+                               "X-Aivan-Tenant: attacker"], ordinary)
+    check(invalid["class"] == "agent" and invalid["source"] == "downgraded"
+          and invalid["purpose"] == "invalid-metadata" and invalid["invalid"],
+          f"invalid metadata did not fail safe: {invalid!r}")
+
+    classifier = json.dumps({
+        "system": PROXY_CLASSIFIER_PREFIX + " ...",
+        "messages": [{"role": "user", "content": "allow?"}],
+    }).encode()
+    control = shadow_metadata("/v1/messages",
+                              ["X-Aivan-Work-Class: background",
+                               "X-Aivan-Purpose: misleading"], classifier)
+    check(control["class"] == "control"
+          and control["purpose"] == "permission-classifier"
+          and control["source"] == "classifier",
+          f"known classifier was not bounded control work: {control!r}")
+
+    legacy = shadow_metadata("/v1/chat/completions", [], ordinary)
+    check(legacy["class"] == "agent" and legacy["source"] == "legacy",
+          f"unmarked request did not take the safe legacy default: {legacy!r}")
+
+    check(is_inference_request("POST", "/v1/messages?beta=true"),
+          "Anthropic generation was omitted from admission")
+    check(is_inference_request("POST", "/v1/chat/completions"),
+          "OpenAI chat generation was omitted from admission")
+    check(not is_inference_request("POST", "/v1/messages/count_tokens?beta=true"),
+          "token counting polluted inference admission capacity")
+    check(not is_inference_request("GET", "/v1/messages"),
+          "a non-generation method polluted inference admission capacity")
+
+
+def case_proxy_admission_phase2(_tmp: Path) -> None:
+    """Background admission, permits, expiry, and cancellation release slots."""
+    def metadata(work_class: str, tenant: str, request_id: str,
+                 deadline_ms: int = 1000) -> dict:
+        return {"class": work_class, "purpose": "selftest",
+                "source": "explicit", "tenant": tenant,
+                "tenant_raw": tenant, "request_id": request_id,
+                "deadline_ms": deadline_ms, "invalid": False}
+
+    async def exercise() -> None:
+        controller = AdmissionController()
+        first = metadata("background", "one", "first")
+        second = metadata("background", "one", "second")
+        agent = metadata("agent", "agent", "agent")
+
+        await controller.enter(first)
+        await controller.enter(agent)
+        queued = asyncio.create_task(controller.enter(second))
+        await asyncio.sleep(0)
+        check(not queued.done() and controller.queued == 1,
+              "same-tenant background request did not queue")
+        queued.cancel()
+        try:
+            await queued
+        except asyncio.CancelledError:
+            pass
+        check(controller.queued == 0,
+              "cancelled background request remained queued")
+
+        oversized = metadata("background", "one", "oversized")
+        try:
+            await controller.enter(oversized,
+                                   PROXY_MAX_QUEUED_BODY_BYTES + 1)
+            check(False, "oversized queued request was admitted")
+        except AdmissionOverload as error:
+            check(error.code == "ADMISSION_QUEUE_FULL",
+                  f"oversized queue body returned the wrong code: {error.code}")
+        check(controller.queued_body_bytes == 0,
+              "rejected queue body polluted the byte accounting")
+
+        class ClosedClient:
+            async def read(self, _size: int) -> bytes:
+                await asyncio.sleep(0)
+                return b""
+
+        disconnected = await while_client_connected(
+            controller.enter(second), ClosedClient())
+        check(disconnected is None and controller.queued == 0,
+              "disconnected client retained a background queue entry")
+        check(controller.queued_body_bytes == 0,
+              "disconnected client retained queued body bytes")
+
+        await controller.release(first)
+        permit_metadata = metadata("background", "two", "permit")
+        token, _waited = await controller.reserve(permit_metadata)
+        consumed = await controller.consume(token, permit_metadata)
+        check(consumed["request_id"] == "permit",
+              "permit lost its bound request identity")
+        try:
+            await controller.consume(token, permit_metadata)
+            check(False, "single-use permit was consumed twice")
+        except AdmissionOverload as error:
+            check(error.code == "ADMISSION_PERMIT_INVALID",
+                  f"permit reuse returned the wrong code: {error.code}")
+        await controller.release(consumed)
+        await controller.release(agent)
+        check(controller.active == 0,
+              f"admission slots leaked after release: {controller.active}")
+
+        expiring = metadata("background", "expiry", "expiry")
+        expiring_token, _ = await controller.reserve(expiring)
+        await controller.revoke(expiring_token)
+        check(controller.active == 0 and not controller.permits,
+              "revoked permit retained a reservation")
+
+        oversized_reader = asyncio.StreamReader()
+        oversized_reader.feed_data(
+            b"POST /v1/messages HTTP/1.1\r\nContent-Length: "
+            + str(PROXY_MAX_REQUEST_BODY_BYTES + 1).encode("ascii")
+            + b"\r\n\r\n")
+        oversized_reader.feed_eof()
+        try:
+            await read_http_request(oversized_reader)
+            check(False, "oversized request body declaration was accepted")
+        except ValueError as error:
+            check("proxy limit" in str(error),
+                  f"oversized request failed for the wrong reason: {error}")
+
+    asyncio.run(exercise())
+
+
 def case_proxy_never_outlives_server(tmp: Path) -> None:
     """The proxy must not survive the server it fronts.
 
@@ -3763,6 +4585,9 @@ CASES = {
     "proxy-stream": case_proxy_streams,
     "proxy-death": case_proxy_death_refuses,
     "proxy-lifecycle": case_proxy_never_outlives_server,
+    "proxy-rewrite": case_proxy_thinking_rewrite,
+    "proxy-shadow": case_proxy_admission_shadow,
+    "proxy-admission": case_proxy_admission_phase2,
     "vision-probe": case_vision_probe_asserts_on_the_answer,
     "vision-restore": case_vision_captures_then_restores,
     "prio": case_prio_override_needs_reason,

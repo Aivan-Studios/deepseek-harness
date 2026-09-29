@@ -2863,7 +2863,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'AgentOptions',
-    declaration: 'export interface AgentOptions {\n    provider?: string;\n    model?: string;\n    maxTokens?: number;\n}',
+    declaration: 'export interface AgentOptions {\n    provider?: string;\n    model?: string;\n    maxTokens?: number;\n    scheduling?: RequestScheduling;\n}',
   },
   {
     name: 'AgentPreset',
@@ -3403,7 +3403,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'GenerateOptions',
-    declaration: 'export interface GenerateOptions {\n    provider: string;\n    model: string;\n    reasoningEffort?: ReasoningEffortId;\n    messages: Message[];\n    system?: string;\n    tools?: ToolSchema[];\n    temperature?: number;\n    maxTokens?: number;\n    stop?: string[];\n    signal?: AbortSignal;\n    sessionId?: Branded<\'SessionId\'>;\n    purpose?: \'compaction\' | \'session-title\';\n}',
+    declaration: 'export interface GenerateOptions {\n    provider: string;\n    model: string;\n    reasoningEffort?: ReasoningEffortId;\n    messages: Message[];\n    system?: string;\n    tools?: ToolSchema[];\n    temperature?: number;\n    maxTokens?: number;\n    stop?: string[];\n    signal?: AbortSignal;\n    sessionId?: Branded<\'SessionId\'>;\n    purpose?: \'compaction\' | \'session-title\';\n    scheduling?: RequestScheduling;\n}',
   },
   {
     name: 'GenericCallView',
@@ -3936,6 +3936,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'RequestRunOutcome',
     declaration: 'export type RequestRunOutcome = \'approved\' | \'completed\' | \'rejected\' | \'cancelled\' | \'failed\';',
+  },
+  {
+    name: 'RequestScheduling',
+    declaration: 'export interface RequestScheduling {\n    class: \'control\' | \'interactive\' | \'agent\' | \'background\';\n    tenant?: string;\n    purpose?: string;\n    requestId?: string;\n    deadlineMs?: number;\n}',
   },
   {
     name: 'ResolvedAlwaysRetryPolicy',

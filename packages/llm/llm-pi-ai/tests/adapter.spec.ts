@@ -111,6 +111,89 @@ describe('PiAiAdapter provider routing', () => {
     expect(server.headers[0]?.['user-agent']).toBe(userAgent())
   })
 
+  it('sends scheduling metadata only for an opted-in local route', async () => {
+    const enabled = await mockServer([
+      { events: textEvents }, { events: textEvents }, { events: textEvents },
+    ])
+    const enabledCtx = await harness(enabled.url, {
+      schedulingHeaders: true,
+      headers: { 'X-Aivan-Work-Class': 'control' },
+    })
+    await assemble(enabledCtx, {
+      model: 'deepseek-v4-flash', messages: [],
+      scheduling: {
+        class: 'interactive', tenant: 'fleet-fe', purpose: 'operator-turn',
+        requestId: 'request-1', deadlineMs: 120_000,
+      },
+    })
+    await assemble(enabledCtx, {
+      model: 'deepseek-v4-flash', messages: [], purpose: 'session-title',
+    })
+    await assemble(enabledCtx, {
+      model: 'deepseek-v4-flash', messages: [], sessionId: 'session-agent' as never,
+    })
+    expect(enabled.headers[0]).toMatchObject({
+      'x-aivan-work-class': 'interactive',
+      'x-aivan-tenant': 'fleet-fe',
+      'x-aivan-purpose': 'operator-turn',
+      'x-aivan-request-id': 'request-1',
+      'x-aivan-queue-deadline-ms': '120000',
+    })
+    expect(enabled.headers[1]).toMatchObject({
+      'x-aivan-work-class': 'background',
+      'x-aivan-purpose': 'session-title',
+    })
+    expect(enabled.headers[2]).toMatchObject({
+      'x-aivan-work-class': 'agent',
+      'x-aivan-tenant': 'session-agent',
+      'x-aivan-purpose': 'agent-turn',
+    })
+
+    const disabled = await mockServer([{ events: textEvents }])
+    const disabledCtx = await harness(disabled.url)
+    await assemble(disabledCtx, {
+      model: 'deepseek-v4-flash', messages: [],
+      scheduling: { class: 'interactive', tenant: 'must-not-leak' },
+    })
+    expect(disabled.headers[0]?.['x-aivan-work-class']).toBeUndefined()
+    expect(disabled.headers[0]?.['x-aivan-tenant']).toBeUndefined()
+  })
+
+  it('acquires and consumes a local admission permit before provider streaming', async () => {
+    const server = await mockServer([
+      {
+        body: JSON.stringify({ permit: 'permit-1', expiresInMs: 5000, queueWaitMs: 50 }),
+        delayMs: 50,
+      },
+      { events: textEvents },
+    ])
+    const ctx = await harness(server.url, {
+      schedulingHeaders: true,
+      admission: true,
+      // The acquire deliberately exceeds this. It must happen before the
+      // provider-read watchdog exists, or this otherwise healthy call fails.
+      streamIdleTimeoutMs: 10,
+    })
+    await assemble(ctx, {
+      model: 'deepseek-v4-flash', messages: [],
+      scheduling: { class: 'background', tenant: 'session-1', purpose: 'subagent' },
+    })
+
+    expect(server.paths).toEqual(['/_aivan/admission/acquire', '/chat/completions'])
+    expect(server.requests[0]).toMatchObject({
+      class: 'background', tenant: 'session-1', purpose: 'subagent',
+    })
+    const requestId = (server.requests[0] as { requestId?: unknown }).requestId
+    expect(requestId).toEqual(expect.any(String))
+    expect(server.headers[1]).toMatchObject({
+      'x-aivan-admission': 'permit-1',
+      'x-aivan-work-class': 'background',
+      'x-aivan-tenant': 'session-1',
+      'x-aivan-purpose': 'subagent',
+      'x-aivan-request-id': requestId,
+    })
+  })
+
   it('forwards common stream options and profile reasoning', async () => {
     const server = await mockServer([{ events: textEvents }])
     const ctx = await harness(server.url, {
@@ -807,6 +890,13 @@ describe('provider profile lifecycle', () => {
     expect(() => resolveProfiles([{ provider: 'openai' }] as never)).toThrow(/dict keyed by provider/)
     expect(() => resolveProfiles({ openai: { provider: 'openai' } as never })).toThrow(/moved to the providers dict key/)
     expect(() => resolveProfiles({ openai: { baseURL: '' } })).toThrow(/empty baseURL/)
+    expect(() => resolveProfiles({ openai: { admission: true } })).toThrow(/schedulingHeaders/)
+    expect(() => resolveProfiles({ openai: {
+      schedulingHeaders: true, admission: true,
+    } })).toThrow(/explicit loopback baseURL/)
+    expect(() => resolveProfiles({ openai: {
+      baseURL: 'https://api.example.com', schedulingHeaders: true, admission: true,
+    } })).toThrow(/loopback HTTP/)
     expect(() => resolveProfiles({ openai: { apiKeyEnv: 'not-a-var!' } })).toThrow(/must match/)
     expect(() => resolveProfiles({ openai: { maxRequestImageBytes: 0 } })).toThrow(/maxRequestImageBytes/)
     expect(resolveProfiles({ openai: {} }).get('openai')?.maxRequestImageBytes)

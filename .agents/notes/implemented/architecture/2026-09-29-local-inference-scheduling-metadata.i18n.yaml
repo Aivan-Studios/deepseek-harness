@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-09-29-local-inference-scheduling-metadata.md
+2026-09-29-local-inference-scheduling-metadata.md: 71d4685088cb2450e626c5e99e6658faf9acd0cb
+2026-09-29-local-inference-scheduling-metadata.zh.md: d221d7ba4613d4cfcbd2d1e89d07f1373de5bf11

@@ -93,6 +93,11 @@
     },
     {
       "doc": "docs/subsystems/llm-streaming.md",
+      "symbol": "RequestScheduling",
+      "source": "packages/llm/llm/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/llm-streaming.md",
       "symbol": "GenerateOptions",
       "source": "packages/llm/llm/src/types.ts"
     },
