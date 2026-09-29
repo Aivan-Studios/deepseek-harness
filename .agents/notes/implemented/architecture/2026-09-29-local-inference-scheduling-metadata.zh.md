@@ -16,7 +16,7 @@ pi-ai adapter 仅在 provider profile 设置 `schedulingHeaders: true` 时传输
 
 loopback `dsh-serve` proxy 会验证有限的 class 集合与有界标头值，在写日志前对 tenant 值做哈希，并在转发至 vLLM 前移除所有 `X-Aivan-*` 字段。Phase 1 shadow counter 会记录按实测的 2 个 active request 策略，每个生成请求将被 admit 还是 queue，但不会延迟或拒绝请求。token counting endpoint 不进入生成计数器，因为它不分配生成 slot 或 KV sequence。现有 Claude auto-mode permission classifier 被识别为有界 control 工作；其他未标记客户端采用 `agent/legacy` 语义。
 
-loopback pi-ai profile 上的 `admission: true` 会在构建提供方 stream watchdog 前获取 proxy permit。该 permit 不透明、只能使用一次、绑定 class、tenant 与 request id，并在五秒内未被消费时失效。Phase 2 只对 background 工作强制 2 个 active request 与每 tenant 1 个 background request 的限制；其他 class 参与 active 计数，但在 weighted fairness 验证完成前仍直接通过。queue expiry、queue capacity、permit mismatch 与 permit reuse 会返回稳定的 `ADMISSION_*` failure，本地路由的 retry policy 不会盲目重试这些 failure。
+loopback pi-ai profile 上的 `admission: true` 会在构建提供方 stream watchdog 前获取 proxy permit。该 permit 不透明、只能使用一次、绑定 class、tenant 与 request id，并在五秒内未被消费时失效。proxy 最多准入两个生成请求，使用平滑加权服务份额选择排队 class，提升等待过久的 background 和 agent 工作，在选中的 class 内轮换 tenant，并保留每 tenant 最多一个 active background request 的限制。queue expiry、queue capacity、permit mismatch 与 permit reuse 会返回稳定的 `ADMISSION_*` failure，本地路由的 retry policy 不会盲目重试这些 failure。`GET /_aivan/admission/status` 会报告有界聚合的 active、queue、body byte、最久等待和 permit 状态，不暴露 tenant 或 request 标识符。
 
 ## Alternatives considered
 
@@ -27,6 +27,6 @@ loopback pi-ai profile 上的 `admission: true` 会在构建提供方 stream wat
 
 ## Consequences
 
-本地 DSH 流量可以按 class 和有界 tenant 身份审计，无需向日志或 vLLM 暴露 prompt 或 tenant 名称。当前 Claude 兼容 Fleet 会话仍是 legacy agent 流量；在其 runtime adapter 提供显式的逐 turn 元数据前，只有已知 control classifier 例外。Shadow active count 描述生成请求到达时的并发量，而不是仅执行 tokenizer 的调用或 vLLM KV fit，也不替代引擎 scheduler。
+本地 DSH 流量可以按 class 和有界 tenant 身份审计，无需向日志或 vLLM 暴露 prompt 或 tenant 名称。启用 loopback 调度 bridge 后，Claude 兼容 Fleet 会话会携带显式的逐 turn 元数据；未标记的 compatibility client 保留安全的 `agent/legacy` 语义。Shadow active count 描述生成请求到达时的并发量，而不是仅执行 tokenizer 的调用或 vLLM KV fit，也不替代引擎 scheduler。
 
-DSH-aware 调用会在提供方 idle timing 开始前等待，而 compatibility client 会在其 HTTP request 内等待。排队客户端断开会取消等待，acquire response 丢失会撤销 reservation。仅对 background 强制限制降低了 Phase 2 的风险，但允许非 background 负载超过两个 active request；Phase 3 会通过 weighted fairness 与 ageing 关闭这一刻意保留的缺口。
+DSH-aware 调用会在提供方 idle timing 开始前等待，而 compatibility client 会在其 HTTP request 内等待。排队客户端断开会取消等待，acquire response 丢失会撤销 reservation。proxy 会保持 vLLM 内部 queue 较浅；vLLM 仍拥有 KV allocation、batching、token scheduling 和 generation。

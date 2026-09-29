@@ -1233,6 +1233,11 @@ PROXY_QUEUE_DEADLINES_MS = {
     "background": 600_000,
 }
 PROXY_WORK_CLASSES = ("control", "interactive", "agent", "background")
+PROXY_CLASS_WEIGHTS = {
+    "control": 16, "interactive": 8, "agent": 4, "background": 1,
+}
+PROXY_BACKGROUND_AGE_MS = 120_000
+PROXY_AGENT_AGE_MS = 60_000
 PROXY_METADATA_MAX_CHARS = 128
 PROXY_SCHEDULING_HEADERS = {
     "x-aivan-work-class", "x-aivan-tenant", "x-aivan-purpose",
@@ -1430,32 +1435,95 @@ class AdmissionOverload(Exception):
 
 
 class AdmissionController:
-    """Phase 2 permits and background-only admission.
-
-    Non-background work remains pass-through while participating in the active
-    count. Background work waits for the measured two-request capacity and a
-    one-active-per-tenant bound. Phase 3 replaces this FIFO condition with the
-    weighted scheduler after lifecycle behavior is proven.
-    """
+    """Bounded two-slot admission with weighted, ageing class selection."""
 
     def __init__(self) -> None:
         self.condition = asyncio.Condition()
         self.active = 0
+        self.active_by_class = {name: 0 for name in PROXY_WORK_CLASSES}
         self.background_by_tenant: dict[str, int] = {}
         self.queued = 0
         self.queued_by_tenant: dict[str, int] = {}
         self.queued_body_bytes = 0
+        self.queue: list[dict] = []
+        self.sequence = 0
+        self.class_current = {name: 0 for name in PROXY_WORK_CLASSES}
+        self.last_tenant_by_class: dict[str, str] = {}
         self.permits: dict[str, tuple[dict, asyncio.Task]] = {}
 
-    def _can_enter(self, metadata: dict) -> bool:
+    def _tenant_eligible(self, metadata: dict) -> bool:
         if metadata["class"] != "background":
             return True
         tenant = metadata["tenant_raw"]
-        return (self.active < PROXY_SHADOW_MAX_ACTIVE
-                and self.background_by_tenant.get(tenant, 0) < 1)
+        return self.background_by_tenant.get(tenant, 0) < 1
+
+    @staticmethod
+    def _effective_class(entry: dict, now: float) -> str:
+        work_class = entry["metadata"]["class"]
+        waited_ms = (now - entry["enqueued_at"]) * 1000
+        if work_class == "background" and waited_ms >= PROXY_BACKGROUND_AGE_MS:
+            return "agent"
+        if work_class == "agent" and waited_ms >= PROXY_AGENT_AGE_MS:
+            return "interactive"
+        return work_class
+
+    def _remove_queued(self, entry: dict) -> None:
+        self.queue.remove(entry)
+        self.queued -= 1
+        self.queued_body_bytes -= entry["body_bytes"]
+        tenant = entry["metadata"]["tenant_raw"]
+        remaining = self.queued_by_tenant.get(tenant, 0) - 1
+        if remaining > 0:
+            self.queued_by_tenant[tenant] = remaining
+        else:
+            self.queued_by_tenant.pop(tenant, None)
+
+    def _pick_queued(self) -> dict | None:
+        now = time.monotonic()
+        eligible = [entry for entry in self.queue
+                    if self._tenant_eligible(entry["metadata"])]
+        if not eligible:
+            return None
+        grouped = {name: [] for name in PROXY_WORK_CLASSES}
+        for entry in eligible:
+            grouped[self._effective_class(entry, now)].append(entry)
+        present = [name for name in PROXY_WORK_CLASSES if grouped[name]]
+        for name in PROXY_WORK_CLASSES:
+            if name in present:
+                self.class_current[name] += PROXY_CLASS_WEIGHTS[name]
+            else:
+                self.class_current[name] = 0
+        selected_class = max(
+            present, key=lambda name: (self.class_current[name],
+                                       -PROXY_WORK_CLASSES.index(name)))
+        self.class_current[selected_class] -= sum(
+            PROXY_CLASS_WEIGHTS[name] for name in present)
+        candidates = sorted(grouped[selected_class], key=lambda item: item["sequence"])
+        last_tenant = self.last_tenant_by_class.get(selected_class)
+        tenants = {item["metadata"]["tenant_raw"] for item in candidates}
+        selected = next((item for item in candidates
+                         if len(tenants) > 1
+                         and item["metadata"]["tenant_raw"] != last_tenant),
+                        candidates[0])
+        self.last_tenant_by_class[selected_class] = \
+            selected["metadata"]["tenant_raw"]
+        return selected
+
+    def _dispatch(self) -> None:
+        while self.active < PROXY_SHADOW_MAX_ACTIVE:
+            entry = self._pick_queued()
+            if entry is None:
+                return
+            self._remove_queued(entry)
+            entry["admitted"] = True
+            self._occupy(entry["metadata"])
+            waited = (time.monotonic() - entry["enqueued_at"]) * 1000
+            if not entry["future"].done():
+                entry["future"].set_result(waited)
 
     def _occupy(self, metadata: dict) -> None:
         self.active += 1
+        self.active_by_class[metadata["class"]] += 1
         if metadata["class"] == "background":
             tenant = metadata["tenant_raw"]
             self.background_by_tenant[tenant] = \
@@ -1463,6 +1531,9 @@ class AdmissionController:
 
     def _release(self, metadata: dict) -> None:
         self.active = max(0, self.active - 1)
+        work_class = metadata["class"]
+        self.active_by_class[work_class] = max(
+            0, self.active_by_class[work_class] - 1)
         if metadata["class"] == "background":
             tenant = metadata["tenant_raw"]
             remaining = self.background_by_tenant.get(tenant, 0) - 1
@@ -1472,13 +1543,18 @@ class AdmissionController:
                 self.background_by_tenant.pop(tenant, None)
 
     async def enter(self, metadata: dict, body_bytes: int = 0) -> float:
-        """Wait if this is background work, then occupy one active slot."""
+        """Wait for weighted admission, then occupy one active slot."""
         started = time.monotonic()
         tenant = metadata["tenant_raw"]
         timeout = min(metadata["deadline_ms"],
                       PROXY_QUEUE_DEADLINES_MS[metadata["class"]]) / 1000
+        entry = None
         async with self.condition:
-            if not self._can_enter(metadata):
+            if (self.active < PROXY_SHADOW_MAX_ACTIVE and not self.queue
+                    and self._tenant_eligible(metadata)):
+                self._occupy(metadata)
+                return (time.monotonic() - started) * 1000
+            else:
                 if (self.queued >= PROXY_MAX_QUEUED
                         or self.queued_by_tenant.get(tenant, 0)
                         >= PROXY_MAX_QUEUED_PER_TENANT
@@ -1490,30 +1566,63 @@ class AdmissionController:
                 self.queued_body_bytes += body_bytes
                 self.queued_by_tenant[tenant] = \
                     self.queued_by_tenant.get(tenant, 0) + 1
-                try:
-                    await asyncio.wait_for(
-                        self.condition.wait_for(lambda: self._can_enter(metadata)),
-                        timeout)
-                except asyncio.TimeoutError as error:
-                    raise AdmissionOverload(
-                        "ADMISSION_DEADLINE_EXCEEDED",
-                        "local inference queue deadline expired") from error
-                finally:
-                    self.queued -= 1
-                    self.queued_body_bytes -= body_bytes
-                    remaining = self.queued_by_tenant.get(tenant, 0) - 1
-                    if remaining > 0:
-                        self.queued_by_tenant[tenant] = remaining
-                    else:
-                        self.queued_by_tenant.pop(tenant, None)
-            self._occupy(metadata)
-        return (time.monotonic() - started) * 1000
+                self.sequence += 1
+                entry = {"metadata": metadata, "body_bytes": body_bytes,
+                         "enqueued_at": started, "sequence": self.sequence,
+                         "future": asyncio.get_running_loop().create_future(),
+                         "admitted": False}
+                self.queue.append(entry)
+                self._dispatch()
+        try:
+            return await asyncio.wait_for(asyncio.shield(entry["future"]), timeout)
+        except asyncio.TimeoutError as error:
+            async with self.condition:
+                if entry["admitted"]:
+                    self._release(metadata)
+                elif entry in self.queue:
+                    self._remove_queued(entry)
+                self._dispatch()
+            raise AdmissionOverload(
+                "ADMISSION_DEADLINE_EXCEEDED",
+                "local inference queue deadline expired") from error
+        except asyncio.CancelledError:
+            async with self.condition:
+                if entry["admitted"]:
+                    self._release(metadata)
+                elif entry in self.queue:
+                    self._remove_queued(entry)
+                self._dispatch()
+            raise
 
     async def release(self, metadata: dict) -> None:
-        """Release one active or reserved slot and wake queued background work."""
+        """Release one active or reserved slot and dispatch queued work."""
         async with self.condition:
             self._release(metadata)
-            self.condition.notify_all()
+            self._dispatch()
+
+    async def snapshot(self) -> dict:
+        """Return bounded queue state without exposing tenant or request IDs."""
+        async with self.condition:
+            now = time.monotonic()
+            queued_by_class = {name: 0 for name in PROXY_WORK_CLASSES}
+            oldest_ms = {name: 0 for name in PROXY_WORK_CLASSES}
+            for entry in self.queue:
+                work_class = entry["metadata"]["class"]
+                queued_by_class[work_class] += 1
+                waited = round((now - entry["enqueued_at"]) * 1000)
+                oldest_ms[work_class] = max(oldest_ms[work_class], waited)
+            return {
+                "active": self.active,
+                "maxActive": PROXY_SHADOW_MAX_ACTIVE,
+                "activeByClass": dict(self.active_by_class),
+                "queued": self.queued,
+                "maxQueued": PROXY_MAX_QUEUED,
+                "queuedByClass": queued_by_class,
+                "queuedBodyBytes": self.queued_body_bytes,
+                "maxQueuedBodyBytes": PROXY_MAX_QUEUED_BODY_BYTES,
+                "oldestQueueMsByClass": oldest_ms,
+                "permits": len(self.permits),
+            }
 
     async def reserve(self, metadata: dict) -> tuple[str, float]:
         """Acquire a single-use permit whose reservation expires quickly."""
@@ -1539,7 +1648,7 @@ class AdmissionController:
             permit = self.permits.pop(token, None)
             if permit is not None:
                 self._release(permit[0])
-                self.condition.notify_all()
+                self._dispatch()
 
     async def consume(self, token: str, metadata: dict) -> dict:
         """Consume a permit only when its bound scheduling identity matches."""
@@ -1564,7 +1673,7 @@ class AdmissionController:
             if permit is not None:
                 permit[1].cancel()
                 self._release(permit[0])
-                self.condition.notify_all()
+                self._dispatch()
 
 
 async def read_http_request(reader) -> tuple[str, str, list[str], bytes]:
@@ -1749,6 +1858,11 @@ async def proxy_serve(listen_port: int, uds: str) -> None:
         try:
             method, path, header_lines, body = await asyncio.wait_for(
                 read_http_request(client_reader), PROXY_REQUEST_TIMEOUT_S)
+            if method == "GET" and path.partition("?")[0] \
+                    == "/_aivan/admission/status":
+                await proxy_json(client_writer, 200,
+                                 await admission.snapshot())
+                return
             if method == "POST" and path.partition("?")[0] \
                     == "/_aivan/admission/acquire":
                 try:
@@ -1758,7 +1872,7 @@ async def proxy_serve(listen_port: int, uds: str) -> None:
                     if acquired is None:
                         return
                     permit, waited = acquired
-                    say("proxy: admission phase2 "
+                    say("proxy: admission phase3 "
                         f"action=reserve class={metadata['class']} "
                         f"purpose={metadata['purpose']} source=acquire "
                         f"tenant={metadata['tenant']} active={admission.active} "
@@ -1815,7 +1929,7 @@ async def proxy_serve(listen_port: int, uds: str) -> None:
                         "error": {"code": error.code,
                                   "message": str(error)}})
                     return
-                say("proxy: admission phase2 "
+                say("proxy: admission phase3 "
                     f"action=admit class={metadata['class']} "
                     f"purpose={metadata['purpose']} source={metadata['source']} "
                     f"tenant={metadata['tenant']} active={admission.active} "
@@ -4307,7 +4421,7 @@ def case_proxy_admission_shadow(_tmp: Path) -> None:
 
 
 def case_proxy_admission_phase2(_tmp: Path) -> None:
-    """Background admission, permits, expiry, and cancellation release slots."""
+    """Weighted admission, permits, expiry, and cancellation release slots."""
     def metadata(work_class: str, tenant: str, request_id: str,
                  deadline_ms: int = 1000) -> dict:
         return {"class": work_class, "purpose": "selftest",
@@ -4380,6 +4494,104 @@ def case_proxy_admission_phase2(_tmp: Path) -> None:
         await controller.revoke(expiring_token)
         check(controller.active == 0 and not controller.permits,
               "revoked permit retained a reservation")
+
+        scheduler = AdmissionController()
+        hold_one = metadata("agent", "hold-one", "hold-one")
+        hold_two = metadata("agent", "hold-two", "hold-two")
+        await scheduler.enter(hold_one)
+        await scheduler.enter(hold_two)
+        background = metadata("background", "background", "background")
+        queued_agent = metadata("agent", "queued-agent", "queued-agent")
+        interactive = metadata("interactive", "interactive", "interactive")
+        background_task = asyncio.create_task(scheduler.enter(background))
+        agent_task = asyncio.create_task(scheduler.enter(queued_agent))
+        interactive_task = asyncio.create_task(scheduler.enter(interactive))
+        await asyncio.sleep(0)
+        check(scheduler.queued == 3,
+              "global two-request cap did not queue every later class")
+        state = await scheduler.snapshot()
+        check(state["active"] == 2 and state["queued"] == 3
+              and state["activeByClass"]["agent"] == 2
+              and state["queuedByClass"] == {
+                  "control": 0, "interactive": 1,
+                  "agent": 1, "background": 1,
+              }, f"admission status snapshot is wrong: {state!r}")
+        await scheduler.release(hold_one)
+        await asyncio.sleep(0)
+        queued_ids = {entry["metadata"]["request_id"]
+                      for entry in scheduler.queue}
+        check("interactive" not in queued_ids
+              and "queued-agent" in queued_ids
+              and "background" in queued_ids,
+              "weighted scheduler did not select interactive first")
+        await interactive_task
+        await scheduler.release(interactive)
+        await asyncio.sleep(0)
+        queued_ids = {entry["metadata"]["request_id"]
+                      for entry in scheduler.queue}
+        check("queued-agent" not in queued_ids
+              and "background" in queued_ids,
+              "weighted scheduler did not select agent second")
+        await agent_task
+        await scheduler.release(queued_agent)
+        await background_task
+        await scheduler.release(background)
+        await scheduler.release(hold_two)
+        check(scheduler.active == 0 and scheduler.queued == 0,
+              "weighted scheduler leaked active or queued work")
+
+        tenant_scheduler = AdmissionController()
+        tenant_one = metadata("background", "tenant-one", "tenant-one")
+        tenant_hold = metadata("agent", "tenant-hold", "tenant-hold")
+        await tenant_scheduler.enter(tenant_one)
+        await tenant_scheduler.enter(tenant_hold)
+        same_tenant = asyncio.create_task(tenant_scheduler.enter(
+            metadata("background", "tenant-one", "same-tenant")))
+        other_metadata = metadata("background", "tenant-two", "other-tenant")
+        other_tenant = asyncio.create_task(tenant_scheduler.enter(other_metadata))
+        await asyncio.sleep(0)
+        await tenant_scheduler.release(tenant_hold)
+        await asyncio.sleep(0)
+        queued_ids = {entry["metadata"]["request_id"]
+                      for entry in tenant_scheduler.queue}
+        check("other-tenant" not in queued_ids
+              and "same-tenant" in queued_ids,
+              "blocked background tenant prevented an eligible peer")
+        await other_tenant
+        await tenant_scheduler.release(other_metadata)
+        check(any(entry["metadata"]["request_id"] == "same-tenant"
+                  for entry in tenant_scheduler.queue),
+              "same tenant exceeded its active background bound")
+        await tenant_scheduler.release(tenant_one)
+        await same_tenant
+        await tenant_scheduler.release(
+            metadata("background", "tenant-one", "same-tenant"))
+
+        now = time.monotonic()
+        aged_background = {"metadata": background,
+                           "enqueued_at": now - 121}
+        aged_agent = {"metadata": queued_agent,
+                      "enqueued_at": now - 61}
+        check(scheduler._effective_class(aged_background, now) == "agent",
+              "background ageing did not promote its service share")
+        check(scheduler._effective_class(aged_agent, now) == "interactive",
+              "agent ageing did not promote its service share")
+
+        deadline_scheduler = AdmissionController()
+        await deadline_scheduler.enter(hold_one)
+        await deadline_scheduler.enter(hold_two)
+        try:
+            await deadline_scheduler.enter(
+                metadata("interactive", "deadline", "deadline", 1))
+            check(False, "expired queued request was admitted")
+        except AdmissionOverload as error:
+            check(error.code == "ADMISSION_DEADLINE_EXCEEDED",
+                  f"queue expiry returned the wrong code: {error.code}")
+        check(deadline_scheduler.queued == 0
+              and deadline_scheduler.active == 2,
+              "queue expiry corrupted scheduler accounting")
+        await deadline_scheduler.release(hold_one)
+        await deadline_scheduler.release(hold_two)
 
         oversized_reader = asyncio.StreamReader()
         oversized_reader.feed_data(

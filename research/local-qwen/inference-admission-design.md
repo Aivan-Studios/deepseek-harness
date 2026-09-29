@@ -1,6 +1,6 @@
 # Local Qwen inference admission and Fleet QoS
 
-**Status:** Accepted architecture; Phases 0–2 complete, Phase 3 full admission next
+**Status:** Accepted architecture; Phases 0–3 complete, Phase 4 Fleet migration next
 **Date:** 2026-09-27
 **Scope:** All local clients of the Qwen3.8-27B vLLM endpoint, with Fleet and
 DSH as the first-class callers
@@ -377,9 +377,9 @@ ceiling.
 
 ### Weighted fair queue with ageing
 
-Within the queued set, use weighted deficit round robin across work classes,
-then FCFS within each `(class, tenant)` queue. This avoids both a single strict
-priority heap and one global FIFO.
+Within the queued set, use smooth weighted round-robin selection across
+effective work classes, then FCFS with tenant alternation inside the selected
+class. This avoids both a single strict priority heap and one global FIFO.
 
 Rules:
 
@@ -881,6 +881,15 @@ are in `admission-bench/phase2-background-report.md`.
 - Enable weighted fairness and ageing.
 - Surface Fleet queue state.
 - Run the acceptance load matrix.
+
+Closed 2026-09-30 for scheduler activation: every generation path shares a
+two-active cap, smooth weighted class selection, ageing, and background tenant
+isolation. Aggregate status is available at
+`GET /_aivan/admission/status`. Three concurrent DSH sessions and a real Fleet
+nested-subagent turn completed without exceeding two active requests. The full
+mixed-context acceptance matrix and Fleet status projection remain the entry
+criteria for Phase 4. Evidence is in
+`admission/phase3-full-admission-report.md`.
 
 ### Phase 4 — Fleet migration
 
