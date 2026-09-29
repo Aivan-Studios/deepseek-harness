@@ -18,6 +18,8 @@ loopback `dsh-serve` proxy 会验证有限的 class 集合与有界标头值，�
 
 loopback pi-ai profile 上的 `admission: true` 会在构建提供方 stream watchdog 前获取 proxy permit。该 permit 不透明、只能使用一次、绑定 class、tenant 与 request id，并在五秒内未被消费时失效。proxy 最多准入两个生成请求，使用平滑加权服务份额选择排队 class，提升等待过久的 background 和 agent 工作，在选中的 class 内轮换 tenant，并保留每 tenant 最多一个 active background request 的限制。queue expiry、queue capacity、permit mismatch 与 permit reuse 会返回稳定的 `ADMISSION_*` failure，本地路由的 retry policy 不会盲目重试这些 failure。`GET /_aivan/admission/status` 会报告有界聚合的 active、queue、body byte、最久等待和 permit 状态，不暴露 tenant 或 request 标识符。
 
+对同一 tenant 与 request id，permit 获取是幂等的。并发重复请求只共享一个 queue entry；若 permit 发出后的 acquire response 丢失，客户端可重试一次并取回同一个仍然有效的 token。若用不同调度元数据复用该身份，或其 permit 已被模型请求消费但请求仍在执行，proxy 会直接失败，不再分配 capacity。这个 retry 仅限于生成开始前的 acquire transport loss；overload、protocol error 和模型生成不会由此机制重试。
+
 ## Alternatives considered
 
 - **把调度字段放入 pi-ai 的提供方专用选项**——否决，因为 initiator 和 agent loop 拥有意图，adapter 拥有传输。
@@ -29,4 +31,4 @@ loopback pi-ai profile 上的 `admission: true` 会在构建提供方 stream wat
 
 本地 DSH 流量可以按 class 和有界 tenant 身份审计，无需向日志或 vLLM 暴露 prompt 或 tenant 名称。启用 loopback 调度 bridge 后，Claude 兼容 Fleet 会话会携带显式的逐 turn 元数据；未标记的 compatibility client 保留安全的 `agent/legacy` 语义。Shadow active count 描述生成请求到达时的并发量，而不是仅执行 tokenizer 的调用或 vLLM KV fit，也不替代引擎 scheduler。
 
-DSH-aware 调用会在提供方 idle timing 开始前等待，而 compatibility client 会在其 HTTP request 内等待。排队客户端断开会取消等待，acquire response 丢失会撤销 reservation。proxy 会保持 vLLM 内部 queue 较浅；vLLM 仍拥有 KV allocation、batching、token scheduling 和 generation。
+DSH-aware 调用会在提供方 idle timing 开始前等待，而 compatibility client 会在其 HTTP request 内等待。排队客户端断开会取消等待。permit 一旦发出，acquire response 丢失时会保留这个短期 reservation，让使用同一 ID 的 retry 取回它；若未取回，expiry 会释放 permit。proxy 会保持 vLLM 内部 queue 较浅；vLLM 仍拥有 KV allocation、batching、token scheduling 和 generation。

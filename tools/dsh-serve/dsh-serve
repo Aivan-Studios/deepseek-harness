@@ -1449,7 +1449,8 @@ class AdmissionController:
         self.sequence = 0
         self.class_current = {name: 0 for name in PROXY_WORK_CLASSES}
         self.last_tenant_by_class: dict[str, str] = {}
-        self.permits: dict[str, tuple[dict, asyncio.Task]] = {}
+        self.permits: dict[str, dict] = {}
+        self.acquire_records: dict[tuple[str, str], dict] = {}
 
     def _tenant_eligible(self, metadata: dict) -> bool:
         if metadata["class"] != "background":
@@ -1598,6 +1599,11 @@ class AdmissionController:
         """Release one active or reserved slot and dispatch queued work."""
         async with self.condition:
             self._release(metadata)
+            key = metadata.get("acquire_key")
+            if key is not None:
+                record = self.acquire_records.get(key)
+                if record is not None and record.get("state") == "consumed":
+                    self.acquire_records.pop(key, None)
             self._dispatch()
 
     async def snapshot(self) -> dict:
@@ -1624,30 +1630,105 @@ class AdmissionController:
                 "permits": len(self.permits),
             }
 
-    async def reserve(self, metadata: dict) -> tuple[str, float]:
-        """Acquire a single-use permit whose reservation expires quickly."""
-        waited = await self.enter(metadata)
+    @staticmethod
+    def _acquire_signature(metadata: dict) -> tuple:
+        return (metadata["class"], metadata["tenant_raw"],
+                metadata["request_id"], metadata["purpose"],
+                metadata["deadline_ms"])
+
+    async def _issue_permit(self, metadata: dict,
+                            key: tuple[str, str]) -> tuple[str, float, int]:
+        """Run the one scheduler entry shared by duplicate acquire calls."""
+        occupied = False
         expiry = None
         try:
+            waited = await self.enter(metadata)
+            occupied = True
             token = secrets.token_urlsafe(32)
             expiry = asyncio.create_task(self._expire(token))
             async with self.condition:
-                self.permits[token] = (metadata, expiry)
-            return token, waited
+                record = self.acquire_records.get(key)
+                if record is None:
+                    raise asyncio.CancelledError
+                expires_at = time.monotonic() + PROXY_PERMIT_TTL_S
+                metadata["acquire_key"] = key
+                self.permits[token] = {
+                    "metadata": metadata, "expiry": expiry,
+                    "key": key, "expires_at": expires_at,
+                }
+                record.update({"state": "issued", "token": token,
+                               "expires_at": expires_at, "waited": waited})
+            return token, waited, int(PROXY_PERMIT_TTL_S * 1000)
         except BaseException:
-            # Cancellation can arrive after enter() occupies the slot but
-            # before the permit becomes visible. Never strand that capacity.
             if expiry is not None:
                 expiry.cancel()
-            await self.release(metadata)
+            if occupied:
+                await self.release(metadata)
             raise
+
+    async def reserve(self, metadata: dict) -> tuple[str, float, int, bool]:
+        """Acquire or recover one idempotent, single-use permit.
+
+        Tenant plus request ID is the logical identity. Concurrent duplicates
+        share one queue entry. Once issued, a duplicate receives the same
+        token with its remaining lifetime; a conflicting or already consumed
+        identity cannot create another reservation.
+        """
+        key = (metadata["tenant_raw"], metadata["request_id"])
+        signature = self._acquire_signature(metadata)
+        async with self.condition:
+            record = self.acquire_records.get(key)
+            duplicate = record is not None
+            if record is not None:
+                if record["signature"] != signature:
+                    raise AdmissionOverload(
+                        "ADMISSION_REQUEST_CONFLICT",
+                        "admission request ID was reused with different metadata")
+                if record["state"] == "consumed":
+                    raise AdmissionOverload(
+                        "ADMISSION_REQUEST_CONSUMED",
+                        "admission request already reached model execution")
+                if record["state"] == "issued":
+                    remaining = max(1, round(
+                        (record["expires_at"] - time.monotonic()) * 1000))
+                    return (record["token"], record["waited"], remaining, True)
+                task = record["task"]
+            else:
+                task = asyncio.create_task(self._issue_permit(metadata, key))
+                record = {"signature": signature, "state": "pending",
+                          "task": task, "waiters": 0}
+                self.acquire_records[key] = record
+            record["waiters"] += 1
+        try:
+            token, waited, expires_ms = await asyncio.shield(task)
+            return token, waited, expires_ms, duplicate
+        finally:
+            cancel_task = None
+            async with self.condition:
+                current = self.acquire_records.get(key)
+                if current is record:
+                    current["waiters"] -= 1
+                    if (current["state"] == "pending"
+                            and current["waiters"] == 0):
+                        self.acquire_records.pop(key, None)
+                        if not task.done():
+                            task.cancel()
+                            cancel_task = task
+            if cancel_task is not None:
+                try:
+                    await cancel_task
+                except asyncio.CancelledError:
+                    pass
 
     async def _expire(self, token: str) -> None:
         await asyncio.sleep(PROXY_PERMIT_TTL_S)
         async with self.condition:
             permit = self.permits.pop(token, None)
             if permit is not None:
-                self._release(permit[0])
+                record = self.acquire_records.get(permit["key"])
+                if record is not None and record.get("token") == token:
+                    self.acquire_records.pop(permit["key"], None)
+                self._release(permit["metadata"])
                 self._dispatch()
 
     async def consume(self, token: str, metadata: dict) -> dict:
@@ -1657,13 +1738,16 @@ class AdmissionController:
             if permit is None:
                 raise AdmissionOverload("ADMISSION_PERMIT_INVALID",
                                         "admission permit is absent, expired, or consumed")
-            reserved, expiry = permit
+            reserved = permit["metadata"]
             fields = ("class", "tenant_raw", "request_id")
             if any(reserved[field] != metadata[field] for field in fields):
                 raise AdmissionOverload("ADMISSION_PERMIT_MISMATCH",
                                         "admission permit does not match the model request")
             self.permits.pop(token)
-            expiry.cancel()
+            permit["expiry"].cancel()
+            record = self.acquire_records.get(permit["key"])
+            if record is not None and record.get("token") == token:
+                record["state"] = "consumed"
             return reserved
 
     async def revoke(self, token: str) -> None:
@@ -1671,8 +1755,9 @@ class AdmissionController:
         async with self.condition:
             permit = self.permits.pop(token, None)
             if permit is not None:
-                permit[1].cancel()
-                self._release(permit[0])
+                permit["expiry"].cancel()
+                self.acquire_records.pop(permit["key"], None)
+                self._release(permit["metadata"])
                 self._dispatch()
 
 
@@ -1771,6 +1856,8 @@ def acquire_metadata(body: bytes) -> dict:
                                   or len(value) > PROXY_METADATA_MAX_CHARS
                                   or "\r" in value or "\n" in value):
             raise ValueError(f"admission acquire {name} is invalid")
+    if not request_id:
+        raise ValueError("admission acquire requestId must be non-empty")
     deadline = request.get("deadlineMs",
                            PROXY_QUEUE_DEADLINES_MS[work_class])
     if not isinstance(deadline, int) or isinstance(deadline, bool) or deadline <= 0:
@@ -1871,9 +1958,10 @@ async def proxy_serve(listen_port: int, uds: str) -> None:
                         admission.reserve(metadata), client_reader)
                     if acquired is None:
                         return
-                    permit, waited = acquired
+                    permit, waited, expires_ms, duplicate = acquired
                     say("proxy: admission phase3 "
-                        f"action=reserve class={metadata['class']} "
+                        f"action={'recover' if duplicate else 'reserve'} "
+                        f"class={metadata['class']} "
                         f"purpose={metadata['purpose']} source=acquire "
                         f"tenant={metadata['tenant']} active={admission.active} "
                         f"queue_wait_ms={round(waited)}")
@@ -1883,18 +1971,23 @@ async def proxy_serve(listen_port: int, uds: str) -> None:
                                   "message": str(error)}})
                     return
                 except AdmissionOverload as error:
-                    await proxy_json(client_writer, 429, {
+                    status = (409 if error.code.startswith(
+                        "ADMISSION_REQUEST_") else 429)
+                    await proxy_json(client_writer, status, {
                         "error": {"code": error.code,
                                   "message": str(error)}})
                     return
                 try:
                     await proxy_json(client_writer, 200, {
                         "permit": permit,
-                        "expiresInMs": int(PROXY_PERMIT_TTL_S * 1000),
+                        "expiresInMs": expires_ms,
                         "queueWaitMs": round(waited),
                     })
                 except (ConnectionError, OSError):
-                    await admission.revoke(permit)
+                    # The response may have crossed the kernel boundary even
+                    # though this write failed. Keep the issued permit until
+                    # its short expiry so a same-ID retry can recover it.
+                    pass
                 return
             inference = is_inference_request(method, path)
             if inference:
@@ -4474,7 +4567,15 @@ def case_proxy_admission_phase2(_tmp: Path) -> None:
 
         await controller.release(first)
         permit_metadata = metadata("background", "two", "permit")
-        token, _waited = await controller.reserve(permit_metadata)
+        token, _waited, _expires, duplicate = await controller.reserve(
+            permit_metadata)
+        check(not duplicate, "first permit acquire was marked duplicate")
+        duplicate_token, _waited, duplicate_expires, duplicate = \
+            await controller.reserve(dict(permit_metadata))
+        check(duplicate and duplicate_token == token and duplicate_expires > 0,
+              "duplicate acquire did not recover the live permit")
+        check(controller.active == 2 and len(controller.permits) == 1,
+              "duplicate acquire created another reservation")
         consumed = await controller.consume(token, permit_metadata)
         check(consumed["request_id"] == "permit",
               "permit lost its bound request identity")
@@ -4484,16 +4585,54 @@ def case_proxy_admission_phase2(_tmp: Path) -> None:
         except AdmissionOverload as error:
             check(error.code == "ADMISSION_PERMIT_INVALID",
                   f"permit reuse returned the wrong code: {error.code}")
+        try:
+            await controller.reserve(dict(permit_metadata))
+            check(False, "consumed request ID acquired a second permit")
+        except AdmissionOverload as error:
+            check(error.code == "ADMISSION_REQUEST_CONSUMED",
+                  f"consumed acquire returned the wrong code: {error.code}")
         await controller.release(consumed)
         await controller.release(agent)
         check(controller.active == 0,
               f"admission slots leaked after release: {controller.active}")
 
         expiring = metadata("background", "expiry", "expiry")
-        expiring_token, _ = await controller.reserve(expiring)
+        expiring_token, _, _, _ = await controller.reserve(expiring)
         await controller.revoke(expiring_token)
-        check(controller.active == 0 and not controller.permits,
+        check(controller.active == 0 and not controller.permits
+              and not controller.acquire_records,
               "revoked permit retained a reservation")
+
+        coalesced = AdmissionController()
+        coalesced_hold_one = metadata("agent", "hold-one", "hold-one")
+        coalesced_hold_two = metadata("agent", "hold-two", "hold-two")
+        await coalesced.enter(coalesced_hold_one)
+        await coalesced.enter(coalesced_hold_two)
+        repeated = metadata("interactive", "repeat", "same-request")
+        repeated_one = asyncio.create_task(coalesced.reserve(repeated))
+        repeated_two = asyncio.create_task(coalesced.reserve(dict(repeated)))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        check(coalesced.queued == 1,
+              "concurrent duplicate acquires created multiple queue entries")
+        conflict = dict(repeated)
+        conflict["purpose"] = "different"
+        try:
+            await coalesced.reserve(conflict)
+            check(False, "conflicting request ID reused an acquire record")
+        except AdmissionOverload as error:
+            check(error.code == "ADMISSION_REQUEST_CONFLICT",
+                  f"acquire conflict returned the wrong code: {error.code}")
+        await coalesced.release(coalesced_hold_one)
+        issued_one, issued_two = await asyncio.gather(
+            repeated_one, repeated_two)
+        check(issued_one[0] == issued_two[0]
+              and {issued_one[3], issued_two[3]} == {False, True},
+              "coalesced acquires did not share exactly one permit")
+        await coalesced.revoke(issued_one[0])
+        await coalesced.release(coalesced_hold_two)
+        check(coalesced.active == 0 and coalesced.queued == 0,
+              "coalesced acquire test leaked scheduler capacity")
 
         scheduler = AdmissionController()
         hold_one = metadata("agent", "hold-one", "hold-one")

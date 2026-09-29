@@ -128,6 +128,8 @@ pi-ai 依据提供方 id 与 baseURL 决定每个请求的形状：系统提示�
 
 适配器强制 pi-ai SDK `maxRetries` 为零，因此一次 `stream()` 调用只会发起一次提供方请求。已移除 profile 字段 `maxRetries` 和 `maxRetryDelayMs` 会使加载失败，而不是静默倍增或隐藏单独组合的 agent（智能体）级重试预算。空闲超时会 abort SDK 的稳定请求信号，并以 `TIMEOUT` 呈现；较早的调用方 abort 仍为 `ABORTED`。
 
+admission acquire 会使用同一个 request id 对 transport loss 重试一次，因此幂等的本地 proxy 会返回原 permit。拒绝、格式错误的 response 和模型生成不会被该机制重试。
+
 ## 端点询问
 
 插件提供 `ctx.llm.registerModelDiscovery('llm-pi-ai', …)`，用来回答「这个提供方能服务哪些模型？」——针对配置界面正在编辑或起草的路由。它刻意**不是** catalog 刷新：什么都不存储，回复是界面供用户采纳的候选。`settings.yaml` 始终是唯一决定路由服务什么的东西。

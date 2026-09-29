@@ -475,6 +475,14 @@ request ID; the server must make this idempotent. A retry after an admitted
 stream begins is a new model attempt and follows normal agent-loop durability
 rules.
 
+Implemented semantics key acquisition by tenant and request ID. Concurrent
+duplicates coalesce onto one scheduler entry; an issued duplicate recovers the
+same token and remaining TTL. Conflicting metadata and retries while the
+original token is consumed fail without another reservation. A disconnected
+pending acquire is still cancelled immediately, while response loss after
+issuance leaves the five-second permit recoverable. The pi-ai admission client
+makes exactly one same-ID retry for fetch or response-body transport loss.
+
 The acceptance test must prove that one overloaded logical request produces at
 most one queued inference request. This is the retry-amplification invariant.
 
@@ -871,8 +879,9 @@ and disconnect cancellation, permit misuse, deadlines, per-tenant depth, a
 selftests. Live DSH traffic used the permit path, while a real Fleet turn with
 two parallel same-tenant subagents held the second background request for
 605 ms and then completed exactly. Interactive and agent calls remain
-pass-through by design. The active profile disables retries until duplicate
-acquire request IDs become idempotent. Full evidence and remaining boundaries
+pass-through by design. The active profile disables agent-level model retries;
+the admission client now performs one same-ID acquire transport retry after
+the server-side idempotency invariant was completed. Full evidence and remaining boundaries
 are in `admission-bench/phase2-background-report.md`.
 
 ### Phase 3 — full admission
@@ -888,7 +897,8 @@ isolation. Aggregate status is available at
 `GET /_aivan/admission/status`. Three concurrent DSH sessions and a real Fleet
 nested-subagent turn completed without exceeding two active requests. The full
 mixed-context acceptance matrix and Fleet status projection remain the entry
-criteria for Phase 4. Evidence is in
+criteria for Phase 4. Idempotent permit acquisition and its bounded client
+transport retry are complete. Evidence is in
 `admission/phase3-full-admission-report.md`.
 
 ### Phase 4 — Fleet migration

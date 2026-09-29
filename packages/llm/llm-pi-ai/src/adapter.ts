@@ -255,28 +255,42 @@ async function acquirePermit(
 ): Promise<{ permit: string; scheduling: RequestScheduling }> {
   const requestId = scheduling.requestId ?? randomUUID()
   const resolved = { ...scheduling, requestId }
-  let response: Response
-  try {
-    response = await fetch(new URL('/_aivan/admission/acquire', baseURL), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        requestId,
-        class: resolved.class,
-        ...resolved.tenant === undefined ? {} : { tenant: resolved.tenant },
-        ...resolved.purpose === undefined ? {} : { purpose: resolved.purpose },
-        ...maxTokens === undefined ? {} : { requestedOutputTokens: maxTokens },
-        ...resolved.deadlineMs === undefined ? {} : { deadlineMs: resolved.deadlineMs },
-      }),
-      ...signal === undefined ? {} : { signal },
-    })
-  } catch (error) {
-    if (signal?.aborted === true) {
-      throw new LlmError('local admission acquire aborted by caller', 'ABORTED', { cause: error })
+  const body = JSON.stringify({
+    requestId,
+    class: resolved.class,
+    ...resolved.tenant === undefined ? {} : { tenant: resolved.tenant },
+    ...resolved.purpose === undefined ? {} : { purpose: resolved.purpose },
+    ...maxTokens === undefined ? {} : { requestedOutputTokens: maxTokens },
+    ...resolved.deadlineMs === undefined ? {} : { deadlineMs: resolved.deadlineMs },
+  })
+  let response: Response | undefined
+  let payload: unknown
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = await fetch(new URL('/_aivan/admission/acquire', baseURL), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+        ...signal === undefined ? {} : { signal },
+      })
+      payload = await response.json().catch((error: unknown) => {
+        // Syntactically invalid JSON is a protocol failure, not an ambiguous
+        // transport loss. A terminated response body is safe to retry because
+        // the proxy keys acquisition by this stable request ID.
+        if (error instanceof SyntaxError) return undefined
+        throw error
+      })
+      break
+    } catch (error) {
+      if (signal?.aborted === true) {
+        throw new LlmError('local admission acquire aborted by caller', 'ABORTED', { cause: error })
+      }
+      if (attempt === 1) {
+        throw new LlmError('local admission acquire transport failed', 'ADMISSION_TRANSPORT', { cause: error })
+      }
     }
-    throw new LlmError('local admission acquire transport failed', 'ADMISSION_TRANSPORT', { cause: error })
   }
-  const payload: unknown = await response.json().catch(() => undefined)
+  if (response === undefined) throw new Error('unreachable admission acquire state')
   if (!response.ok) {
     const failure = payload as { error?: { code?: unknown; message?: unknown } } | undefined
     const code = typeof failure?.error?.code === 'string' ? failure.error.code : 'ADMISSION_OVERLOAD'

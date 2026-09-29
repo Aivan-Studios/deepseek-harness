@@ -127,6 +127,8 @@ Supported profile fields are `apiKeyEnv`, `displayName`, `api`, `baseURL`, `mode
 
 The adapter forces pi-ai's SDK `maxRetries` to zero so one `stream()` call makes one provider request. The removed profile fields `maxRetries` and `maxRetryDelayMs` fail load instead of silently multiplying or hiding the separately composed agent-level retry budget. Idle expiry aborts the SDK's stable request signal and surfaces `TIMEOUT`; an earlier caller abort remains `ABORTED`.
 
+Admission acquisition retries one transport loss with the same request id, so an idempotent local proxy returns the original permit. It does not retry a refusal, a malformed response, or model generation.
+
 ## Endpoint interrogation
 
 The plugin offers `ctx.llm.registerModelDiscovery('llm-pi-ai', …)`, which answers "which models can this provider serve?" for a route a configuration surface is editing or drafting. It is deliberately *not* a catalog refresh: nothing is stored, and the reply is candidates the surface offers for adoption. `settings.yaml` remains the only thing that decides what a route serves.

@@ -194,6 +194,34 @@ describe('PiAiAdapter provider routing', () => {
     })
   })
 
+  it('retries one ambiguous acquire transport loss with the same request ID', async () => {
+    const server = await mockServer([
+      { drop: true },
+      { body: JSON.stringify({ permit: 'recovered', expiresInMs: 4000, queueWaitMs: 12 }) },
+      { events: textEvents },
+    ])
+    const ctx = await harness(server.url, {
+      schedulingHeaders: true,
+      admission: true,
+    })
+    await assemble(ctx, {
+      model: 'deepseek-v4-flash', messages: [],
+      scheduling: { class: 'interactive', tenant: 'session-retry', purpose: 'operator-turn' },
+    })
+
+    expect(server.paths).toEqual([
+      '/_aivan/admission/acquire',
+      '/_aivan/admission/acquire',
+      '/chat/completions',
+    ])
+    const first = server.requests[0] as { requestId?: unknown }
+    const second = server.requests[1] as { requestId?: unknown }
+    expect(first.requestId).toEqual(expect.any(String))
+    expect(second.requestId).toBe(first.requestId)
+    expect(server.headers[2]?.['x-aivan-admission']).toBe('recovered')
+    expect(server.headers[2]?.['x-aivan-request-id']).toBe(first.requestId)
+  })
+
   it('forwards common stream options and profile reasoning', async () => {
     const server = await mockServer([{ events: textEvents }])
     const ctx = await harness(server.url, {

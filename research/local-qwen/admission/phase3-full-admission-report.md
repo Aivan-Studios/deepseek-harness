@@ -15,6 +15,8 @@ Python compilation and all six proxy selftests passed. The admission selftest co
 
 An alternate-port proxy against the production vLLM UDS held two agent permits, exposed one queued interactive request at 203 ms in its status response, and admitted it after 4.986 seconds when a reservation expired. The snapshot reported exactly two active agents, one queued interactive request, and two live permits.
 
+The idempotency follow-up used another isolated proxy against the production UDS. Two sequential acquires with the same tenant, request ID, and metadata returned the same opaque permit; its reported TTL decreased from 5000 to 4988 ms rather than creating a fresh reservation. Reusing that identity with a different purpose returned HTTP 409 and `ADMISSION_REQUEST_CONFLICT`. The abandoned permit expired after five seconds, returning active and permit counts to zero. After production restart, a source-run headless DSH turn returned exactly `LIVE_IDEMPOTENCY_OK`; its agent and title calls both traversed reserve and permit-admit paths, and final admission state was empty.
+
 ## Production workload
 
 After a normal restart loaded Phase 3, three concurrent permit-aware DSH sessions returned `PHASE3_DSH_1`, `PHASE3_DSH_2`, and `PHASE3_DSH_3`. The first agent and a title request occupied both slots. Later agent permits waited 3.410 and 8.290 seconds, and background title work waited 11.165 seconds. No admission record exceeded `active=2`, and queue time remained outside the provider idle watchdog.
@@ -23,4 +25,4 @@ A real Fleet operator turn launched two Agent subagents and returned `FLEET_PHAS
 
 ## Remaining work
 
-Phase 3 establishes bounded global scheduling and aggregate visibility. Acquire retries remain disabled until duplicate request IDs are idempotent across ambiguous response loss. Fleet does not yet project the aggregate status in its operator UI, and the full mixed-context acceptance matrix remains the next audit before broad Fleet migration.
+Phase 3 establishes bounded global scheduling and aggregate visibility. The follow-up idempotency increment coalesces concurrent duplicate acquire request IDs, recovers the same live permit after ambiguous response loss, rejects metadata conflicts and already-consumed duplicates, and makes exactly one same-ID client retry for acquire transport loss. Unit coverage proves that two duplicates create one queued request and one reservation. Fleet does not yet project the aggregate status in its operator UI, and the full mixed-context acceptance matrix remains the next audit before broad Fleet migration.

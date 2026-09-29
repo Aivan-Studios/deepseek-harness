@@ -18,6 +18,8 @@ The loopback `dsh-serve` proxy validates the finite class set and bounded header
 
 `admission: true` on a loopback pi-ai profile acquires a proxy permit before constructing the provider stream watchdog. The permit is opaque, single-use, bound to class, tenant, and request id, and expires after five seconds if it is not consumed. The proxy admits at most two generation requests, selects queued classes with smooth weighted service shares, promotes aged background and agent work, alternates tenants within a selected class, and retains the one-active-background-per-tenant bound. Queue expiry, queue capacity, permit mismatch, and permit reuse return stable `ADMISSION_*` failures, which the local route's retry policy does not retry blindly. `GET /_aivan/admission/status` reports bounded aggregate active, queue, body-byte, oldest-wait, and permit state without tenant or request identifiers.
 
+Permit acquisition is idempotent for one tenant and request id. Concurrent duplicates share one queue entry, and an acquire response lost after issuance can be retried once to recover the same live token. Reusing that identity with different scheduling metadata, or while its permit is already consumed by a model request, fails without allocating capacity. The retry is confined to pre-generation acquire transport loss; overload, protocol errors, and model generation are not retried by this mechanism.
+
 ## Alternatives considered
 
 - **Put scheduling fields in provider-specific pi-ai options** — rejected because initiators and the agent loop own intent while adapters own transport.
@@ -29,4 +31,4 @@ The loopback `dsh-serve` proxy validates the finite class set and bounded header
 
 Local DSH traffic can be audited by class and bounded tenant identity without exposing prompts or tenant names to logs or vLLM. Claude-compatible Fleet sessions carry explicit per-turn metadata when their loopback scheduling bridge is enabled; unmarked compatibility clients retain safe `agent/legacy` semantics. Shadow active counts describe concurrent generation requests at arrival, not tokenizer-only calls or vLLM KV fit, and do not replace the engine's scheduler.
 
-DSH-aware calls wait before provider idle timing begins, while compatibility clients wait inside their HTTP request. A queued client disconnect cancels its wait and a dropped acquire response revokes its reservation. The proxy keeps vLLM's internal queue shallow; vLLM still owns KV allocation, batching, token scheduling, and generation.
+DSH-aware calls wait before provider idle timing begins, while compatibility clients wait inside their HTTP request. A queued client disconnect cancels its wait. Once a permit is issued, a dropped acquire response retains the short-lived reservation so a same-ID retry can recover it; expiry releases an unrecovered permit. The proxy keeps vLLM's internal queue shallow; vLLM still owns KV allocation, batching, token scheduling, and generation.
