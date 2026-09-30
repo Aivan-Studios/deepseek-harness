@@ -22,6 +22,29 @@ export interface InitializeParams {
   model: string
   /** Optional positive output-token cap inherited by SDK-created agents and their in-process descendants. */
   maxTokens?: number
+  /** Optional agent preset composed into every SDK-owned session. */
+  agentPreset?: string
+  /**
+   * Per-process caller context interpolated through the
+   * `sdk_system_prompt_append` system-prompt variable. A selected preset must
+   * render the complete value; initialization of the first session fails if it
+   * does not, so identity or task context cannot be dropped silently.
+   */
+  systemPromptAppend?: string
+  /** Caller-owned tools registered in every SDK-owned session. */
+  hostTools?: HostToolDefinition[]
+  /** Route composed tool `ask` decisions back to the embedding host. */
+  hostToolGate?: boolean
+}
+
+/** One caller-owned tool whose execution crosses back over JSON-RPC. */
+export interface HostToolDefinition {
+  /** Model-facing tool name, unique within the composed session. */
+  name: string
+  /** Model-facing description. */
+  description: string
+  /** Supported object-rooted JSON Schema for model arguments. */
+  parameters: Record<string, unknown>
 }
 
 /** Wire-stable server identity returned by initialization. */
@@ -43,6 +66,54 @@ export interface SessionPromptResult {
   /** Identity of the queued user message. */
   messageId: string
 }
+
+/** Create or resume one SDK-owned session before its first prompt. */
+export interface SessionOpenParams {
+  /** Stable session identity. */
+  sessionId: string
+  /** Resume the persisted session instead of creating a fresh one. */
+  resume?: boolean
+}
+
+/** Confirmed live session identity. */
+export interface SessionOpenResult {
+  sessionId: string
+}
+
+/** Cancel active and queued work for one live SDK-owned session. */
+export interface SessionCancelParams {
+  sessionId: string
+}
+
+/** Cancellation receipt; `active` is false for an unknown session. */
+export interface SessionCancelResult {
+  active: boolean
+}
+
+/** Server-to-client execution request for one caller-owned tool. */
+export interface HostToolExecuteParams {
+  sessionId: string
+  name: string
+  arguments: Record<string, unknown>
+}
+
+/** Canonical text returned to the model for a caller-owned tool. */
+export interface HostToolExecuteResult {
+  text: string
+}
+
+/** One composed DSH tool policy asking the embedding host for approval. */
+export interface HostToolGateParams {
+  sessionId: string
+  name: string
+  arguments: Record<string, unknown>
+  reason?: string
+}
+
+/** Host verdict for a gated DSH tool call. */
+export type HostToolGateResult =
+  | { behavior: 'allow' }
+  | { behavior: 'deny'; message: string }
 
 /** Deployment-mapped SDK outcome: `ok` for an accepted result, `error` otherwise. */
 export type SdkRunStatus = 'ok' | 'error'
@@ -100,6 +171,14 @@ export interface HarnessSdkNotificationMap {
 /** Client-to-server request methods with their param and result shapes. */
 export interface HarnessSdkRequestMap {
   'initialize': { params: InitializeParams; result: InitializeResult }
+  'session/open': { params: SessionOpenParams; result: SessionOpenResult }
   'session/prompt': { params: SessionPromptParams; result: SessionPromptResult }
+  'session/cancel': { params: SessionCancelParams; result: SessionCancelResult }
   'shutdown': { params: undefined; result: Record<string, never> }
+}
+
+/** Runtime-to-client requests served by an embedding host. */
+export interface HarnessSdkHostRequestMap {
+  'host/tool-execute': { params: HostToolExecuteParams; result: HostToolExecuteResult }
+  'host/tool-gate': { params: HostToolGateParams; result: HostToolGateResult }
 }

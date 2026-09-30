@@ -121,6 +121,10 @@ class HarnessClient:
         provider: str,
         model: str,
         max_tokens: int | None = None,
+        agent_preset: str | None = None,
+        system_prompt_append: str | None = None,
+        host_tools: list[JsonObject] | None = None,
+        host_tool_gate: bool | None = None,
     ) -> InitializeResponse:
         payload: JsonObject = {
             "cwd": str(Path(cwd).resolve()),
@@ -129,11 +133,39 @@ class HarnessClient:
         }
         if max_tokens is not None:
             payload["maxTokens"] = max_tokens
+        if agent_preset is not None:
+            payload["agentPreset"] = agent_preset
+        if system_prompt_append is not None:
+            payload["systemPromptAppend"] = system_prompt_append
+        if host_tools is not None:
+            payload["hostTools"] = host_tools
+        if host_tool_gate is not None:
+            payload["hostToolGate"] = host_tool_gate
         try:
             return self.request("initialize", payload, response_model=InitializeResponse)
         except BaseException:
             self.close()
             raise
+
+    def session_open(self, session_id: str, *, resume: bool = False) -> str:
+        """Materialize a fresh or persisted runtime session."""
+        response = self.request(
+            "session/open",
+            {"sessionId": session_id, "resume": resume},
+            response_model=_SessionOpenResponse,
+        )
+        if response.sessionId != session_id:
+            raise TypeError("session/open returned the wrong session id")
+        return response.sessionId
+
+    def session_cancel(self, session_id: str) -> bool:
+        """Cancel active and queued work for a runtime session."""
+        response = self.request(
+            "session/cancel",
+            {"sessionId": session_id},
+            response_model=_SessionCancelResponse,
+        )
+        return response.active
 
     def session_prompt(
         self,
@@ -547,6 +579,14 @@ class NotificationSubscription:
 
 class _SessionPromptResponse(BaseModel):
     messageId: str
+
+
+class _SessionOpenResponse(BaseModel):
+    sessionId: str
+
+
+class _SessionCancelResponse(BaseModel):
+    active: bool
 
 
 class _ShutdownResponse(BaseModel):

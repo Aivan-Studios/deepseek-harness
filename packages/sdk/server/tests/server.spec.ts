@@ -109,6 +109,26 @@ async function settleSubagent(
 }
 
 describe('HarnessSdkJsonRpcServer', () => {
+  it('rejects duplicate or unsupported host tool schemas during initialization', async () => {
+    const ctx = new Context()
+    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+    const base = { cwd: process.cwd(), provider: 'unused', model: 'unused' }
+    const tool = {
+      name: 'reply_status',
+      description: 'Report status',
+      parameters: { type: 'object' as const, properties: {} },
+    }
+
+    await expect(server.initialize({ ...base, hostTools: [tool, tool] }))
+      .rejects.toThrow('duplicate host tool name: reply_status')
+    await expect(server.initialize({
+      ...base,
+      hostTools: [{ ...tool, parameters: { type: 'string' } }],
+    })).rejects.toThrow()
+    await server.shutdown()
+    await ctx.fiber.dispose()
+  })
+
   it('creates a harness agent and calls the configured OpenAI-compatible endpoint', { timeout: 15_000 }, async () => {
     const storageDir = await mkdtemp(join(tmpdir(), 'dsh-jsonrpc-'))
     const llmServer = await mockCompletionServer()

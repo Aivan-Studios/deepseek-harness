@@ -6,6 +6,13 @@
  */
 
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type {
+  HostToolDefinition,
+  HostToolExecuteParams,
+  HostToolExecuteResult,
+  HostToolGateParams,
+  HostToolGateResult,
+} from '@deepseek-ai/dsh-sdk-protocol'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 
 /** One server-to-client notification as received off the wire. */
@@ -18,6 +25,12 @@ export interface HarnessNotification {
 
 /** Predicate deciding whether a subscription receives a notification. */
 export type NotificationFilter = (notification: HarnessNotification) => boolean
+
+/** Execute one tool owned by the embedding SDK host. */
+export type HostToolHandler = (request: HostToolExecuteParams) => Promise<HostToolExecuteResult>
+
+/** Resolve one composed DSH tool-policy approval ask. */
+export type HostToolGateHandler = (request: HostToolGateParams) => Promise<HostToolGateResult>
 
 /** Launch and timeout options for {@link HarnessClient}. */
 export interface HarnessClientOptions {
@@ -42,6 +55,10 @@ export interface HarnessClientOptions {
   disposeEofGraceMs?: number
   /** Termination confirmation window (ms) after SIGTERM/SIGKILL during `close()` (default 3000). */
   disposeGraceMs?: number
+  /** Handler for runtime-to-client `host/tool-execute` requests. */
+  hostToolHandler?: HostToolHandler
+  /** Handler for runtime-to-client `host/tool-gate` requests. */
+  hostToolGateHandler?: HostToolGateHandler
 }
 
 /** Options for the high-level {@link DeepSeekHarness} wrapper. */
@@ -56,6 +73,14 @@ export interface DeepSeekHarnessOptions {
   model?: string
   /** Maximum output tokens for each conversation-model request. */
   maxTokens?: number
+  /** Agent preset composed into every runtime session. */
+  agentPreset?: string
+  /** Caller context rendered by the preset's `sdk_system_prompt_append` variable. */
+  systemPromptAppend?: string
+  /** Caller-owned tool schemas executed by the launch host-tool handler. */
+  hostTools?: HostToolDefinition[]
+  /** Route composed tool approval asks to the launch host's request handler. */
+  hostToolGate?: boolean
 }
 
 /** One owned session activity interval, from enqueue receipt through idle. */

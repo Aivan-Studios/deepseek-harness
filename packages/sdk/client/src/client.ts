@@ -16,8 +16,12 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import {
   JsonRpcLineTransport,
   JsonRpcResponseError,
+  type HostToolExecuteParams,
+  type HostToolGateParams,
   type InitializeParams,
   type InitializeResult,
+  type SessionCancelResult,
+  type SessionOpenResult,
   type SessionPromptParams,
 } from '@deepseek-ai/dsh-sdk-protocol'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -255,6 +259,22 @@ export class HarnessClient {
       this.transport?.close()
     })
     const transport = new JsonRpcLineTransport(child.stdout, child.stdin)
+    transport.onRequest(async (method, params) => {
+      if (typeof params.sessionId !== 'string' || typeof params.name !== 'string' || !isRecord(params.arguments)) {
+        throw new SdkProtocolError(`${method} carried malformed parameters: ${JSON.stringify(params)}`)
+      }
+      if (method === 'host/tool-execute') {
+        const handler = this.options.hostToolHandler
+        if (handler === undefined) throw new Error('runtime requested a host tool but no hostToolHandler is configured')
+        return handler(params as unknown as HostToolExecuteParams)
+      }
+      if (method === 'host/tool-gate') {
+        const handler = this.options.hostToolGateHandler
+        if (handler === undefined) throw new Error('runtime requested a tool gate but no hostToolGateHandler is configured')
+        return handler(params as unknown as HostToolGateParams)
+      }
+      throw new Error(`unknown runtime request method: ${method}`)
+    })
     transport.onNotification((method, params) => { this.dispatchNotification({ method, params }) })
     transport.start()
     this.transport = transport
@@ -272,6 +292,33 @@ export class HarnessClient {
       throw new SdkProtocolError(`initialize returned no server identity: ${JSON.stringify(result)}`)
     }
     return { serverInfo: { name: result.serverInfo.name, version: result.serverInfo.version } }
+  }
+
+  /**
+   * Materialize a fresh or persisted runtime session.
+   * @param sessionId - stable session identity owned by the caller.
+   * @param resume - whether the id must resolve to persisted state.
+   * @returns the runtime-confirmed session identity.
+   */
+  async openSession(sessionId: string, resume = false): Promise<string> {
+    const result = await this.request('session/open', { sessionId, resume }) as SessionOpenResult
+    if (!isRecord(result) || result.sessionId !== sessionId) {
+      throw new SdkProtocolError(`session/open returned the wrong session id: ${JSON.stringify(result)}`)
+    }
+    return result.sessionId
+  }
+
+  /**
+   * Cancel active and queued work for a runtime session.
+   * @param sessionId - target session identity.
+   * @returns whether the runtime had a live session to cancel.
+   */
+  async cancelSession(sessionId: string): Promise<boolean> {
+    const result = await this.request('session/cancel', { sessionId }) as SessionCancelResult
+    if (!isRecord(result) || typeof result.active !== 'boolean') {
+      throw new SdkProtocolError(`session/cancel returned no cancellation receipt: ${JSON.stringify(result)}`)
+    }
+    return result.active
   }
 
   /**

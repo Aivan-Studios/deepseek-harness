@@ -6,7 +6,7 @@ The `jsonrpc` plugin serves newline-delimited JSON-RPC over stdio so out-of-proc
 
 ## Wiring
 
-`inject: ['agents']`. The server gets or creates one agent per `sessionId`. It forwards subagent completions only when the service-snapshotted lifecycle `local` flag is true; provider names, child ids, and durable lineage never establish locality. A registered adapter wins, an unowned `deepseek-official` route mounts `dsh-llm-deepseek`, and any other unowned provider fails initialization. Other capabilities come from the surrounding `cordis.yml`.
+`inject: ['agents']`. The server gets, creates, or resumes one agent per `sessionId`. An optional agent preset is mounted in the new agent scope before caller-owned prompt text and tools are registered. It forwards subagent completions only when the service-snapshotted lifecycle `local` flag is true; provider names, child ids, and durable lineage never establish locality. A registered adapter wins, an unowned `deepseek-official` route mounts `dsh-llm-deepseek`, and any other unowned provider fails initialization. Other capabilities come from the surrounding `cordis.yml`.
 
 ## Config
 
@@ -22,7 +22,11 @@ The plugin answers `shutdown`, flushes the response, disposes the root context s
 
 ## Wire notes
 
-`initialize` is the runtime-readiness boundary: when the server is mounted by a Loader composition, it waits for the current plugin tree to settle before replying, so async sibling capabilities such as initial MCP tool discovery are visible to the first prompt. Hand-built contexts without Loader remain immediately usable. `initialize.serverInfo.name` is the wire-stable `deepseek-harness-sdk-runtime`. An optional positive `initialize.maxTokens` becomes the request output cap of each SDK-created agent and its in-process descendants; invalid values reject initialization, while omission sends no SDK cap and allows the selected adapter or provider route default to apply. `session/prompt` queues one identified user message and immediately returns `{ messageId }`. The server streams every durable fact as `session.event` and every whole-agent lifecycle transition as `session.status`; it does not assign an assistant message or `turn/end` to that prompt. Independent requests may enqueue more work on the same session. Persistence roots and persona come from `cordis.yml`.
+`initialize` is the runtime-readiness boundary: when the server is mounted by a Loader composition, it waits for the current plugin tree to settle before replying, so async sibling capabilities such as initial MCP tool discovery are visible to the first prompt. Hand-built contexts without Loader remain immediately usable. `initialize.serverInfo.name` is the wire-stable `deepseek-harness-sdk-runtime`. An optional positive `initialize.maxTokens` becomes the request output cap of each SDK-created agent and its in-process descendants; invalid values reject initialization, while omission sends no SDK cap and allows the selected adapter or provider route default to apply.
+
+`initialize.agentPreset` selects an agent-scoped composition. `systemPromptAppend` is exposed as `sdk_system_prompt_append`; when supplied, session creation renders the complete system prompt and fails unless the selected composition contains the exact value. This prevents a complete persona from silently dropping caller identity or task context. `hostTools` registers object-schema tools whose execution returns to the client through `host/tool-execute`. With `hostToolGate`, a prepended agent-scoped policy captures downstream `ask` decisions and resolves them through `host/tool-gate`, preserving the original arguments and reason.
+
+`session/open` creates or resumes a session before its first prompt. `session/cancel` cooperatively cancels its active and queued work. `session/prompt` queues one identified user message and immediately returns `{ messageId }`. The server streams every durable fact as `session.event` and every whole-agent lifecycle transition as `session.status`; it does not assign an assistant message or `turn/end` to that prompt. Independent requests may enqueue more work on the same session. Persistence roots and base composition come from `cordis.yml`.
 
 ## Model Experience
 
@@ -30,7 +34,7 @@ The plugin answers `shutdown`, flushes the response, disposes the root context s
 
 #### What the model sees
 
-For each accepted `session/prompt`, the conversation model receives the caller-supplied `contentBlocks` verbatim as one user message in that SDK session. This package adds no system-prompt prose or tool schema; those come from the plugins in the surrounding `cordis.yml`.
+For each accepted `session/prompt`, the conversation model receives the caller-supplied `contentBlocks` verbatim as one user message in that SDK session. When configured, the model also sees the caller's verified `systemPromptAppend` and `hostTools` schemas beside the selected preset's composition.
 
 #### Token effect
 
@@ -42,7 +46,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 ## Known Limitations and Deferred Work
 
-- **The wire has no per-session close or prompt-cancel method** — SDK-created agents remain live until process shutdown.
+- **The wire has no per-session close method** — cancelled SDK-created agents remain live until process shutdown.
 - **There is no per-prompt result** — `MessageId` identifies inbox admission only; clients that own an automation interval must define and observe that interval themselves.
 - **stdout purity is deployment-enforced** — a surrounding config can still load a stdout logger and corrupt the JSON-RPC channel; this plugin does not inspect or veto sibling loggers.
 - **Automatic adapter mounting is DeepSeek-specific** — `initialize` can reuse any pre-registered model adapter, but its only fallback mounts `dsh-llm-deepseek`.

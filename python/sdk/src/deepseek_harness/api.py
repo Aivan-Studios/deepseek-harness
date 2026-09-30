@@ -22,6 +22,10 @@ class DeepSeekHarnessConfig:
     provider: str = "deepseek-official"
     model: str = "deepseek-v4-flash"
     max_tokens: int | None = None
+    agent_preset: str | None = None
+    system_prompt_append: str | None = None
+    host_tools: list[JsonObject] | None = None
+    host_tool_gate: bool | None = None
     cwd: str | None = None
     runtime_cwd: str | None = None
     session_root: str | None = None
@@ -103,6 +107,10 @@ class DeepSeekHarness:
             provider=self.config.provider,
             model=self.config.model,
             max_tokens=self.config.max_tokens,
+            agent_preset=self.config.agent_preset,
+            system_prompt_append=self.config.system_prompt_append,
+            host_tools=self.config.host_tools,
+            host_tool_gate=self.config.host_tool_gate,
         )
         self._initialized = True
 

@@ -6,19 +6,29 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-agent-presets'
 import { resolve } from 'node:path'
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import { assembleContextFor, type Agent, type AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { carrierKeyOf, type Scoped } from '@deepseek-ai/dsh-scope'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
 import * as LlmDeepSeek from '@deepseek-ai/dsh-llm-deepseek'
+import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+import { assertObjectJsonSchema, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type {
+  HostToolDefinition,
+  HostToolExecuteResult,
+  HostToolGateResult,
   InitializeParams,
   InitializeResult,
   JsonRpcTransportPeer,
+  SessionCancelParams,
+  SessionCancelResult,
   SessionEventNotification,
+  SessionOpenParams,
+  SessionOpenResult,
   SessionPromptParams,
   SessionPromptResult,
   SubagentFinishedNotification,
@@ -55,6 +65,10 @@ export class HarnessSdkJsonRpcServer {
   private provider = 'deepseek-official'
   private model = 'deepseek-official'
   private maxTokens: number | undefined
+  private agentPreset: string | undefined
+  private systemPromptAppend: string | undefined
+  private hostTools: readonly HostToolDefinition[] = []
+  private hostToolGate = false
   private llmFiber: { dispose(): Promise<void> } | undefined
   private readonly sessions = new Map<string, SessionRecord>()
   private readonly sessionCreations = new Map<string, Promise<SessionRecord>>()
@@ -117,6 +131,10 @@ export class HarnessSdkJsonRpcServer {
     this.provider = params.provider
     this.model = params.model
     this.maxTokens = params.maxTokens
+    this.agentPreset = params.agentPreset
+    this.systemPromptAppend = params.systemPromptAppend
+    this.hostTools = this.validateHostTools(params.hostTools ?? [])
+    this.hostToolGate = params.hostToolGate === true
     if (!this.hasAdapterFor(this.provider)) {
       if (this.provider !== 'deepseek-official') throw new Error(`no adapter registered for provider "${this.provider}"`)
       this.llmFiber = await this.ctx.plugin(LlmDeepSeek, {})
@@ -125,12 +143,22 @@ export class HarnessSdkJsonRpcServer {
   }
 
   /**
+   * Materialize a fresh or persisted session before its first prompt.
+   * @param params - stable identity and create/resume intent.
+   * @returns the live session identity.
+   */
+  async open(params: SessionOpenParams): Promise<SessionOpenResult> {
+    await this.getOrCreateSession(params.sessionId, params.resume === true)
+    return { sessionId: params.sessionId }
+  }
+
+  /**
    * Queue one identified prompt without assigning later activity to it.
    * @param params - target session and user content.
    * @returns the durable message identity.
    */
   async prompt(params: SessionPromptParams): Promise<SessionPromptResult> {
-    const rec = await this.getOrCreateSession(params.sessionId)
+    const rec = await this.getOrCreateSession(params.sessionId, false)
     // An agent-loop-only reload disposes the loop's agents while this record
     // survives; a retained agent accepts followup() silently, so validate the
     // record against the live registry before delivery (as the ACP bridge does).
@@ -140,6 +168,18 @@ export class HarnessSdkJsonRpcServer {
     const message = createUserMessage({ content: params.contentBlocks, source: { kind: 'user' } })
     rec.handle.agent.followup(message)
     return { messageId: message.id }
+  }
+
+  /**
+   * Cancel active and queued work for a live session.
+   * @param params - target session identity.
+   * @returns whether the server had a live session to cancel.
+   */
+  cancel(params: SessionCancelParams): SessionCancelResult {
+    const rec = this.sessions.get(params.sessionId)
+    if (rec === undefined) return { active: false }
+    rec.handle.agent.cancel({ kind: 'user' })
+    return { active: true }
   }
 
   /**
@@ -191,8 +231,12 @@ export class HarnessSdkJsonRpcServer {
     switch (method) {
       case 'initialize':
         return this.initialize(params as unknown as InitializeParams)
+      case 'session/open':
+        return this.open(params as unknown as SessionOpenParams)
       case 'session/prompt':
         return this.prompt(params as unknown as SessionPromptParams)
+      case 'session/cancel':
+        return this.cancel(params as unknown as SessionCancelParams)
       case 'shutdown':
         return this.shutdown()
       default:
@@ -200,13 +244,13 @@ export class HarnessSdkJsonRpcServer {
     }
   }
 
-  private async getOrCreateSession(sessionId: string): Promise<SessionRecord> {
+  private async getOrCreateSession(sessionId: string, resume = false): Promise<SessionRecord> {
     if (this.shuttingDown) throw new Error('SDK server is shutting down')
     const existing = this.sessions.get(sessionId)
     if (existing) return existing
     const pending = this.sessionCreations.get(sessionId)
     if (pending) return pending
-    const creation = this.createSession(sessionId)
+    const creation = this.createSession(sessionId, resume)
     this.sessionCreations.set(sessionId, creation)
     void creation.then(
       () => { this.sessionCreations.delete(sessionId) },
@@ -215,23 +259,101 @@ export class HarnessSdkJsonRpcServer {
     return creation
   }
 
-  private async createSession(sessionId: string): Promise<SessionRecord> {
-    // No preset composition: this server's compositions keep the model-facing
-    // rows in the host plane, so this agent reads them from the global layer. A
-    // deployment that configures a roster has to join one here first
-    // (@deepseek-ai/dsh-agent-presets README, "Composing a child agent").
-    const handle = await this.ctx.agents.create({
-      sessionId: SessionId(sessionId),
-      meta: { cwd: this.cwd },
-      agentOptions: {
-        provider: this.provider,
-        model: this.model,
-        ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
-      },
-    })
+  private async createSession(sessionId: string, resume: boolean): Promise<SessionRecord> {
+    const agentOptions = {
+      provider: this.provider,
+      model: this.model,
+      ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
+    }
+    const setup = async (agentCtx: Context): Promise<void> => {
+      if (this.agentPreset !== undefined) {
+        const presets = this.ctx.get('agentPresets')
+        if (presets === undefined) {
+          throw new Error(`agent preset "${this.agentPreset}" requested but no agent-presets service is loaded`)
+        }
+        await presets.mount(agentCtx, this.agentPreset)
+      }
+      if (this.systemPromptAppend !== undefined) {
+        agentCtx.systemPrompt.variable('sdk_system_prompt_append', () => this.systemPromptAppend ?? '')
+      }
+      for (const tool of this.hostTools) agentCtx.tools.register(this.hostTool(sessionId, tool))
+      if (this.hostToolGate) {
+        agentCtx.on('tools/pre-execute', async (exec, next) => {
+          const decision = await next()
+          if (decision.kind !== 'ask') return decision
+          const result = await this.transport.request('host/tool-gate', {
+            sessionId,
+            name: exec.name,
+            arguments: exec.arguments as Record<string, unknown>,
+            ...(decision.reason === undefined ? {} : { reason: decision.reason }),
+          }, exec.signal) as HostToolGateResult
+          return result.behavior === 'allow'
+            ? { kind: 'allow' as const }
+            : { kind: 'deny' as const, reason: result.message }
+        }, { prepend: true })
+      }
+      if (this.systemPromptAppend !== undefined) {
+        const agent = agentCtx.agent
+        if (agent === undefined) throw new Error('SDK-created agent has no scoped agent identity during setup')
+        const rendered = renderPrompt(await agentCtx.systemPrompt.assemble(assembleContextFor(agent)))
+        if (!rendered.includes(this.systemPromptAppend)) {
+          throw new Error(
+            'selected composition did not render the SDK system-prompt append; '
+            + 'include {{sdk_system_prompt_append}} in its complete persona',
+          )
+        }
+      }
+    }
+    const handle = resume
+      ? await this.ctx.agents.resume({
+        resumeSessionId: SessionId(sessionId),
+        agentOptions,
+        setup,
+      })
+      : await this.ctx.agents.create({
+        sessionId: SessionId(sessionId),
+        meta: { cwd: this.cwd, ...(this.agentPreset === undefined ? {} : { agentPreset: this.agentPreset }) },
+        agentOptions,
+        setup,
+      })
     const rec: SessionRecord = { handle }
     this.sessions.set(sessionId, rec)
     return rec
+  }
+
+  private validateHostTools(tools: readonly HostToolDefinition[]): readonly HostToolDefinition[] {
+    const names = new Set<string>()
+    for (const tool of tools) {
+      if (tool.name.length === 0) throw new TypeError('host tool name must not be empty')
+      if (names.has(tool.name)) throw new TypeError(`duplicate host tool name: ${tool.name}`)
+      names.add(tool.name)
+      assertObjectJsonSchema(tool.parameters)
+    }
+    return tools.map(tool => ({ ...tool, parameters: { ...tool.parameters } }))
+  }
+
+  private hostTool(sessionId: string, tool: HostToolDefinition): ToolDefinition {
+    return {
+      ...tool,
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{
+          type: 'text',
+          text: typeof value === 'string' ? value : JSON.stringify(value),
+        }],
+      },
+      execute: async (args, exec) => {
+        const result = await this.transport.request('host/tool-execute', {
+          sessionId,
+          name: tool.name,
+          arguments: args as Record<string, unknown>,
+        }, exec.signal) as HostToolExecuteResult
+        if (typeof result.text !== 'string') {
+          throw new Error(`host tool "${tool.name}" returned no text result`)
+        }
+        return result.text
+      },
+    }
   }
 
   private hasAdapterFor(provider: string): boolean {

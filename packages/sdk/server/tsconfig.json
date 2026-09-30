@@ -24,6 +24,15 @@
       "path": "../../core/agent"
     },
     {
+      "path": "../../core/system-prompt"
+    },
+    {
+      "path": "../../core/tools"
+    },
+    {
+      "path": "../../preset/agent-presets"
+    },
+    {
       "path": "../../core/session"
     },
     {

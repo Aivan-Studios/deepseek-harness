@@ -24,6 +24,8 @@ export type {
   DeepSeekHarnessOptions,
   HarnessClientOptions,
   HarnessNotification,
+  HostToolHandler,
+  HostToolGateHandler,
   NotificationFilter,
   RunResult,
 } from './types.ts'

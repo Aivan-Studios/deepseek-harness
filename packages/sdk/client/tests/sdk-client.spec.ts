@@ -147,7 +147,7 @@ describe('DeepSeekHarness', () => {
     await harness.close()
   })
 
-  it('sends the configured cwd/provider/model/maxTokens in the handshake exactly once', async () => {
+  it('sends the complete host-owned composition in the handshake exactly once', async () => {
     const dir = await tempDir('sdk-client-init-')
     const recordFile = join(dir, 'init.jsonl')
     const harness = new DeepSeekHarness({
@@ -156,6 +156,14 @@ describe('DeepSeekHarness', () => {
       provider: 'custom-provider',
       model: 'custom-model',
       maxTokens: 4096,
+      agentPreset: 'lean',
+      systemPromptAppend: 'Fleet identity and task',
+      hostTools: [{
+        name: 'reply_status',
+        description: 'Report status',
+        parameters: { type: 'object', properties: {} },
+      }],
+      hostToolGate: true,
     })
     cleanups.push(() => harness.close())
     await harness.run('one')
@@ -167,6 +175,14 @@ describe('DeepSeekHarness', () => {
       provider: 'custom-provider',
       model: 'custom-model',
       maxTokens: 4096,
+      agentPreset: 'lean',
+      systemPromptAppend: 'Fleet identity and task',
+      hostTools: [{
+        name: 'reply_status',
+        description: 'Report status',
+        parameters: { type: 'object', properties: {} },
+      }],
+      hostToolGate: true,
     }])
   })
 
@@ -243,6 +259,15 @@ describe('DeepSeekHarness', () => {
 })
 
 describe('HarnessClient', () => {
+  it('opens and cancels explicit sessions', async () => {
+    const client = new HarnessClient(fakeLaunch())
+    cleanups.push(() => client.close())
+    await client.initialize({ cwd: process.cwd(), provider: 'p', model: 'm' })
+    await expect(client.openSession('stable-session', true)).resolves.toBe('stable-session')
+    await expect(client.cancelSession('stable-session')).resolves.toBe(true)
+    await expect(client.cancelSession('missing')).resolves.toBe(false)
+  })
+
   it('times out a hung request at the per-call bound', async () => {
     const client = new HarnessClient(fakeLaunch({ FAKE_HANG_PROMPT: '1' }))
     cleanups.push(() => client.close())

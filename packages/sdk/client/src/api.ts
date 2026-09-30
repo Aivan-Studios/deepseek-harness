@@ -26,6 +26,10 @@ export class DeepSeekHarness implements AsyncDisposable {
   private readonly provider: string
   private readonly model: string
   private readonly maxTokens: number | undefined
+  private readonly agentPreset: string | undefined
+  private readonly systemPromptAppend: string | undefined
+  private readonly hostTools: DeepSeekHarnessOptions['hostTools']
+  private readonly hostToolGate: boolean | undefined
   private initialized: Promise<void> | undefined
   private closed = false
 
@@ -40,6 +44,10 @@ export class DeepSeekHarness implements AsyncDisposable {
     this.provider = options.provider ?? 'deepseek-official'
     this.model = options.model ?? 'deepseek-v4-flash'
     this.maxTokens = options.maxTokens
+    this.agentPreset = options.agentPreset
+    this.systemPromptAppend = options.systemPromptAppend
+    this.hostTools = options.hostTools
+    this.hostToolGate = options.hostToolGate
   }
 
   /**
@@ -68,6 +76,10 @@ export class DeepSeekHarness implements AsyncDisposable {
           provider: this.provider,
           model: this.model,
           ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
+          ...this.agentPreset === undefined ? {} : { agentPreset: this.agentPreset },
+          ...this.systemPromptAppend === undefined ? {} : { systemPromptAppend: this.systemPromptAppend },
+          ...this.hostTools === undefined ? {} : { hostTools: this.hostTools },
+          ...this.hostToolGate === undefined ? {} : { hostToolGate: this.hostToolGate },
         })
       } catch (error) {
         this.initialized = undefined

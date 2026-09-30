@@ -6,7 +6,7 @@
 
 ## 组装
 
-`inject: ['agents']`。服务器按 `sessionId` 获取或创建一个 agent。只有服务对生命周期建立快照时记录的 `local` 标志为 true，服务器才会转发 subagent 完成事件；提供方名称、子级 id 和持久化谱系均不能证明本地性。已注册的适配器优先；尚无适配器负责的 `deepseek-official` 路由会挂载 `dsh-llm-deepseek`，任何其他尚无适配器负责的提供方都会导致初始化失败。其他能力由外围 `cordis.yml` 提供。
+`inject: ['agents']`。服务器按 `sessionId` 获取、创建或恢复一个 agent。可选的 agent preset 会在注册调用方提示词文本和工具之前挂载到新 agent 作用域。只有服务对生命周期建立快照时记录的 `local` 标志为 true，服务器才会转发 subagent 完成事件；提供方名称、子级 id 和持久化谱系均不能证明本地性。已注册的适配器优先；尚无适配器负责的 `deepseek-official` 路由会挂载 `dsh-llm-deepseek`，任何其他尚无适配器负责的提供方都会导致初始化失败。其他能力由外围 `cordis.yml` 提供。
 
 ## 配置
 
@@ -22,7 +22,11 @@ Stdout 只承载 JSON-RPC 帧。部署不得组合 stdout logger；诊断应写�
 
 ## 协议说明
 
-`initialize` 是运行时就绪边界：服务器由 Loader 组合挂载时，会等待当前插件树完成所有加载任务后再响应，因此首次提示词能够看到 MCP 初始工具发现等异步同级能力。没有 Loader 的手工组装上下文仍可立即使用。`initialize.serverInfo.name` 的协议稳定值为 `deepseek-harness-sdk-runtime`。可选的正整数 `initialize.maxTokens` 会成为每个 SDK 创建的 agent 及其进程内后代的请求输出上限；非法值会使初始化失败，省略时则不发送 SDK 上限，并应用所选适配器或提供方路由的默认值。`session/prompt` 将一条带标识的用户消息排入队列，并立即返回 `{ messageId }`。服务器将每个持久事实作为 `session.event` 流式发出，并将整个 agent 生命周期的每次状态转换作为 `session.status` 发出；它不会把某条助手消息或 `turn/end` 归属于该提示词。同一会话上的独立请求可以继续排入更多工作。持久化根目录和 persona 由 `cordis.yml` 提供。
+`initialize` 是运行时就绪边界：服务器由 Loader 组合挂载时，会等待当前插件树完成所有加载任务后再响应，因此首次提示词能够看到 MCP 初始工具发现等异步同级能力。没有 Loader 的手工组装上下文仍可立即使用。`initialize.serverInfo.name` 的协议稳定值为 `deepseek-harness-sdk-runtime`。可选的正整数 `initialize.maxTokens` 会成为每个 SDK 创建的 agent 及其进程内后代的请求输出上限；非法值会使初始化失败，省略时则不发送 SDK 上限，并应用所选适配器或提供方路由的默认值。
+
+`initialize.agentPreset` 选择 agent 作用域组合。`systemPromptAppend` 暴露为 `sdk_system_prompt_append`；提供该值时，会话创建会渲染完整系统提示词，并在所选组合不含该原值时失败。这可防止完整 persona 静默丢弃调用方身份或任务上下文。`hostTools` 注册对象 schema 工具，其执行通过 `host/tool-execute` 返回客户端。启用 `hostToolGate` 后，前置的 agent 作用域策略会捕获下游 `ask` 决策，并通过 `host/tool-gate` 解析，同时保留原始参数与原因。
+
+`session/open` 在首个提示词前创建或恢复会话。`session/cancel` 协作式取消其活动和排队工作。`session/prompt` 将一条带标识的用户消息排入队列，并立即返回 `{ messageId }`。服务器将每个持久事实作为 `session.event` 流式发出，并将整个 agent 生命周期的每次状态转换作为 `session.status` 发出；它不会把某条助手消息或 `turn/end` 归属于该提示词。同一会话上的独立请求可以继续排入更多工作。持久化根目录和基础组合由 `cordis.yml` 提供。
 
 ## 模型体验
 
@@ -30,7 +34,7 @@ Stdout 只承载 JSON-RPC 帧。部署不得组合 stdout logger；诊断应写�
 
 #### 模型看到的内容
 
-对于每个已接受的 `session/prompt`，对话模型会将调用方提供的 `contentBlocks` 原样作为该 SDK 会话中的一条用户消息接收。此包不会添加系统提示词文本或工具 schema；这些内容来自外围 `cordis.yml` 中的插件。
+对于每个已接受的 `session/prompt`，对话模型会将调用方提供的 `contentBlocks` 原样作为该 SDK 会话中的一条用户消息接收。配置后，模型还会在所选 preset 组合之外看到经验证的调用方 `systemPromptAppend` 与 `hostTools` schema。
 
 #### Token 影响
 
@@ -42,7 +46,7 @@ Stdout 只承载 JSON-RPC 帧。部署不得组合 stdout logger；诊断应写�
 
 ## 已知限制与暂缓事项
 
-- **协议没有逐会话关闭或提示词取消方法**：SDK 创建的 agent 会一直存活到进程关闭。
+- **协议没有逐会话关闭方法**：取消后的 SDK 创建 agent 会一直存活到进程关闭。
 - **没有逐提示词结果**：`MessageId` 只标识 inbox 准入；拥有自动化活动区间的客户端必须自行定义并观察该区间。
 - **stdout 纯净性由部署保证**：外围配置仍可能加载 stdout logger 并破坏 JSON-RPC 通道；此插件不会检查或否决同级 logger。
 - **自动挂载适配器仅支持 DeepSeek**：`initialize` 可以复用任何预先注册的模型适配器，但唯一的回退行为是挂载 `dsh-llm-deepseek`。

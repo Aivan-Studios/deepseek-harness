@@ -222,6 +222,12 @@ reader.on('line', (line) => {
       respond({ messageId })
       return
     }
+    case 'session/open':
+      respond({ sessionId: sessionIdOf(frame.params) })
+      return
+    case 'session/cancel':
+      respond({ active: sessionIdOf(frame.params) !== 'missing' })
+      return
     case 'shutdown':
       respond({})
       // An EOF-ignoring fake also refuses the protocol exit, so the client's

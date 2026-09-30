@@ -94,6 +94,14 @@ for line in sys.stdin:
     with DeepSeekHarness(
         model="deepseek-v4-flash",
         max_tokens=4096,
+        agent_preset="lean",
+        system_prompt_append="Fleet identity and task",
+        host_tools=[{
+            "name": "reply_status",
+            "description": "Report status",
+            "parameters": {"type": "object", "properties": {}},
+        }],
+        host_tool_gate=True,
         cwd=str(tmp_path),
         cordis=str(tmp_path / "cordis.yml"),
         session_root=str(tmp_path / "sessions"),
@@ -121,6 +129,14 @@ for line in sys.stdin:
         "provider": "deepseek-official",
         "model": "deepseek-v4-flash",
         "maxTokens": 4096,
+        "agentPreset": "lean",
+        "systemPromptAppend": "Fleet identity and task",
+        "hostTools": [{
+            "name": "reply_status",
+            "description": "Report status",
+            "parameters": {"type": "object", "properties": {}},
+        }],
+        "hostToolGate": True,
     }
 
 
@@ -653,6 +669,40 @@ for line in sys.stdin:
         client.initialize(provider="deepseek-official", cwd="/workspace", model="dsagent")
         with pytest.raises(ValueError):
             client.session_prompt("main", [{"type": "text", "text": "fix it"}])
+
+
+def test_client_opens_and_cancels_explicit_sessions(tmp_path: Path) -> None:
+    script = tmp_path / "fake_bridge.py"
+    script.write_text(
+        """
+import json
+import sys
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        result = {"serverInfo": {"name": "fake-dsh"}}
+    elif method == "session/open":
+        result = {"sessionId": params["sessionId"]}
+    elif method == "session/cancel":
+        result = {"active": params["sessionId"] != "missing"}
+    elif method == "shutdown":
+        result = {}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+    if method == "shutdown":
+        break
+""".strip()
+    )
+
+    with HarnessClient(HarnessConfig(launch_args_override=(sys.executable, str(script)))) as client:
+        client.initialize(provider="deepseek-official", cwd="/workspace", model="dsagent")
+        assert client.session_open("stable-session", resume=True) == "stable-session"
+        assert client.session_cancel("stable-session") is True
+        assert client.session_cancel("missing") is False
 
 
 def test_client_routes_bridge_requests_and_sends_responses(tmp_path: Path) -> None:
