@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-09-29-local-inference-scheduling-metadata.md
-2026-09-29-local-inference-scheduling-metadata.md: 4a92fafee35b39f480ac5c3058a678dbac378779
-2026-09-29-local-inference-scheduling-metadata.zh.md: e6b53b3be7070d203ed574e5d05d60ba59260f78
+2026-09-29-local-inference-scheduling-metadata.md: 80033e15b2ca6b5f109d8c1ec96b801b18e96f18
+2026-09-29-local-inference-scheduling-metadata.zh.md: 6d3229395796d029006cfa4edf151755409410b5

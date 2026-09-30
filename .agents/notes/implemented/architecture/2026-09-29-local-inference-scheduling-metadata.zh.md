@@ -20,6 +20,8 @@ loopback pi-ai profile 上的 `admission: true` 会在构建提供方 stream wat
 
 对同一 tenant 与 request id，permit 获取是幂等的。并发重复请求只共享一个 queue entry；若 permit 发出后的 acquire response 丢失，客户端可重试一次并取回同一个仍然有效的 token。若用不同调度元数据复用该身份，或其 permit 已被模型请求消费但请求仍在执行，proxy 会直接失败，不再分配 capacity。这个 retry 仅限于生成开始前的 acquire transport loss；overload、protocol error 和模型生成不会由此机制重试。
 
+admission 还会预留保守的 estimated-token budget。纯文本 DSH 调用会发送根据 UTF-8 byte 推导的 input estimate 以及请求的 output cap；compatibility 调用则从完整 request body 推导同样有界的估值。active request 仍最多为两个，且其聚合 reservation 不得超过 130K token；唯一例外是单个更大的 request 可以独占运行。较小的 control 工作可以利用大型 request 旁的剩余 headroom。排队 request 因 token fit 最多被绕过八次；达到上限后会暂停非 control backfill，避免连续的小工作让它饥饿。这是经实测校准的 admission headroom，并不替代 vLLM 的权威 KV allocator。
+
 ## Alternatives considered
 
 - **把调度字段放入 pi-ai 的提供方专用选项**——否决，因为 initiator 和 agent loop 拥有意图，adapter 拥有传输。

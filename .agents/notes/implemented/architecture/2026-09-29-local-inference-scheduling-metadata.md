@@ -20,6 +20,8 @@ The loopback `dsh-serve` proxy validates the finite class set and bounded header
 
 Permit acquisition is idempotent for one tenant and request id. Concurrent duplicates share one queue entry, and an acquire response lost after issuance can be retried once to recover the same live token. Reusing that identity with different scheduling metadata, or while its permit is already consumed by a model request, fails without allocating capacity. The retry is confined to pre-generation acquire transport loss; overload, protocol errors, and model generation are not retried by this mechanism.
 
+Admission also reserves a conservative estimated-token budget. Text-only DSH calls send a UTF-8-byte-derived input estimate with their requested output cap; compatibility calls derive the same bounded estimate from the complete request body. At most two requests may be active, and their aggregate reservation must remain at or below 130K tokens, except that one individually larger request can run alone. Smaller control work can backfill headroom beside a large request. A queued request can be bypassed for token fit only eight times before non-control backfill pauses, preventing a stream of cheap work from starving it. This is calibrated admission headroom, not a replacement for vLLM's authoritative KV allocator.
+
 ## Alternatives considered
 
 - **Put scheduling fields in provider-specific pi-ai options** — rejected because initiators and the agent loop own intent while adapters own transport.

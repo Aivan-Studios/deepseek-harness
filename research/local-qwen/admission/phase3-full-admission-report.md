@@ -1,7 +1,7 @@
 # Phase 3 full-admission audit
 
 **Date:** 2026-09-30
-**Result:** PASS for global two-request admission
+**Result:** PASS for global two-request boundedness; mixed-context policy follow-up required
 
 ## Policy
 
@@ -25,4 +25,6 @@ A real Fleet operator turn launched two Agent subagents and returned `FLEET_PHAS
 
 ## Remaining work
 
-Phase 3 establishes bounded global scheduling and aggregate visibility. The follow-up idempotency increment coalesces concurrent duplicate acquire request IDs, recovers the same live permit after ambiguous response loss, rejects metadata conflicts and already-consumed duplicates, and makes exactly one same-ID client retry for acquire transport loss. Unit coverage proves that two duplicates create one queued request and one reservation. Fleet does not yet project the aggregate status in its operator UI, and the full mixed-context acceptance matrix remains the next audit before broad Fleet migration.
+Phase 3 establishes bounded global scheduling and aggregate visibility. The follow-up idempotency increment coalesces concurrent duplicate acquire request IDs, recovers the same live permit after ambiguous response loss, rejects metadata conflicts and already-consumed duplicates, and makes exactly one same-ID client retry for acquire transport loss. Unit coverage proves that two duplicates create one queued request and one reservation.
+
+The subsequent [mixed-context acceptance matrix](phase3-mixed-context-report.md) passed stability and boundedness but initially failed control-latency isolation: a control request arriving behind two active 70K backgrounds expired at the proxy's 30-second deadline. The corrected proxy now enforces a calibrated 130K aggregate estimated-token reservation while retaining the two-request ceiling and permitting one larger request to run alone. The production retest passed 3/3 with 16.061-second control TTFT, 51.5% peak KV, and zero preemptions. The mixed-context blocker is closed; Fleet status projection remains outstanding.

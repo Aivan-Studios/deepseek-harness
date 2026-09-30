@@ -29,3 +29,4 @@ This directory preserves the design records, benchmark conclusions, operational 
 - [Phase 1 Fleet shadow audit](admission/phase1-fleet-shadow-report.md)
 - [Phase 2 background-enforcement audit](admission/phase2-background-report.md)
 - [Phase 3 full-admission audit](admission/phase3-full-admission-report.md)
+- [Phase 3 mixed-context acceptance matrix](admission/phase3-mixed-context-report.md)

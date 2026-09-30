@@ -130,6 +130,8 @@ pi-ai 依据提供方 id 与 baseURL 决定每个请求的形状：系统提示�
 
 admission acquire 会使用同一个 request id 对 transport loss 重试一次，因此幂等的本地 proxy 会返回原 permit。拒绝、格式错误的 response 和模型生成不会被该机制重试。
 
+对于纯文本 request，acquire 会附带一个根据已 materialize 的 pi-ai context 的 UTF-8 大小推导出的保守 input-token estimate。本地 proxy 会把该估值与请求的 output cap 合并，以保留经实测校准的 KV headroom。image request 不使用 byte-derived estimate，因为编码后的 image byte 不适用文本校准；proxy 会采用安全的未知 input fallback。
+
 ## 端点询问
 
 插件提供 `ctx.llm.registerModelDiscovery('llm-pi-ai', …)`，用来回答「这个提供方能服务哪些模型？」——针对配置界面正在编辑或起草的路由。它刻意**不是** catalog 刷新：什么都不存储，回复是界面供用户采纳的候选。`settings.yaml` 始终是唯一决定路由服务什么的东西。

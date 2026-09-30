@@ -129,6 +129,8 @@ The adapter forces pi-ai's SDK `maxRetries` to zero so one `stream()` call makes
 
 Admission acquisition retries one transport loss with the same request id, so an idempotent local proxy returns the original permit. It does not retry a refusal, a malformed response, or model generation.
 
+For a text-only request, acquisition includes a conservative input-token estimate derived from the UTF-8 size of the materialized pi-ai context. The local proxy combines that estimate with the requested output cap to preserve calibrated KV headroom. Image requests omit the byte-derived estimate because encoded image bytes do not have the text calibration; the proxy applies its safe unknown-input fallback.
+
 ## Endpoint interrogation
 
 The plugin offers `ctx.llm.registerModelDiscovery('llm-pi-ai', …)`, which answers "which models can this provider serve?" for a route a configuration surface is editing or drafting. It is deliberately *not* a catalog refresh: nothing is stored, and the reply is candidates the surface offers for adoption. `settings.yaml` remains the only thing that decides what a route serves.

@@ -246,10 +246,17 @@ interface AdmissionResponse {
   queueWaitMs: number
 }
 
+/** Conservative text-context estimate calibrated against the local tokenizer. */
+function estimatedInputTokens(context: unknown): number {
+  const bytes = new TextEncoder().encode(JSON.stringify(context)).byteLength
+  return Math.max(1, Math.ceil(bytes / 3))
+}
+
 /** Acquire one single-use local admission permit before provider timing starts. */
 async function acquirePermit(
   baseURL: string,
   scheduling: RequestScheduling,
+  inputTokens: number | undefined,
   maxTokens: number | undefined,
   signal: AbortSignal | undefined,
 ): Promise<{ permit: string; scheduling: RequestScheduling }> {
@@ -260,6 +267,7 @@ async function acquirePermit(
     class: resolved.class,
     ...resolved.tenant === undefined ? {} : { tenant: resolved.tenant },
     ...resolved.purpose === undefined ? {} : { purpose: resolved.purpose },
+    ...inputTokens === undefined ? {} : { estimatedInputTokens: inputTokens },
     ...maxTokens === undefined ? {} : { requestedOutputTokens: maxTokens },
     ...resolved.deadlineMs === undefined ? {} : { deadlineMs: resolved.deadlineMs },
   })
@@ -467,7 +475,13 @@ export class PiAiAdapter extends LlmAdapter {
         if (profile.baseURL === undefined) {
           throw new LlmError('local admission requires an explicit provider baseURL', 'ADMISSION_CONFIG')
         }
-        admission = await acquirePermit(profile.baseURL, scheduling, options.maxTokens, upstream)
+        admission = await acquirePermit(
+          profile.baseURL,
+          scheduling,
+          containsImage ? undefined : estimatedInputTokens(context),
+          options.maxTokens,
+          upstream,
+        )
       }
       const streamIdleTimeoutMs = profile.streamIdleTimeoutMs
       using watchdog = idleWatchdog(upstream, streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')

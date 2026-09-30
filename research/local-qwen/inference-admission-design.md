@@ -401,21 +401,28 @@ endless interactive stream to starve maintenance and background progress.
 
 ### Token estimates
 
-Request count is sufficient for the first enforcement release because vLLM
-retains the real KV-fit decision. Still record:
+Request count was sufficient for the first enforcement release because vLLM
+retains the real KV-fit decision. The mixed-context matrix then proved that two
+70K requests could consume 93.2% of KV and make delayed control work miss its
+30-second queue deadline, so calibrated token headroom is now enforced. Record:
 
 - captured body bytes;
 - client-supplied estimated input tokens when available;
 - requested maximum output tokens;
 - actual prompt/completion tokens from the final response.
 
-DSH can estimate with the real local tokenizer before permit acquisition. The
-proxy treats the estimate as advisory and bounds it against request size. Do
-not import the heavyweight vLLM Python environment into the supervisor merely
-to tokenize requests.
+Text-only DSH calls conservatively estimate from the UTF-8 bytes of their
+materialized provider context before permit acquisition. Compatibility calls
+use the complete request body's byte size. Three bytes per token deliberately
+overestimates the measured deterministic text prompts, and missing estimates
+take a safe serialization fallback. Requested output is included. Image input
+does not use the text-byte calibration.
 
-After calibration, token estimates may influence fair-queue cost and
-opportunistic admission. They must not become a second, fallible KV allocator.
+The initial aggregate reservation budget is 130K estimated tokens, below the
+70K+70K case that reached 93.2% KV. One larger request can run alone. Smaller
+work may backfill remaining headroom, but one queued request can be bypassed at
+most eight times before non-control backfill pauses. The estimate remains
+advisory and bounded; it is admission headroom, not a second KV allocator.
 
 ### Native vLLM priority
 
@@ -898,8 +905,14 @@ isolation. Aggregate status is available at
 nested-subagent turn completed without exceeding two active requests. The full
 mixed-context acceptance matrix and Fleet status projection remain the entry
 criteria for Phase 4. Idempotent permit acquisition and its bounded client
-transport retry are complete. Evidence is in
-`admission/phase3-full-admission-report.md`.
+transport retry are complete. The matrix subsequently passed stability but
+the count-only policy failed control-latency isolation when two 70K background
+requests occupied both slots: a delayed control request expired after 30
+seconds. The production correction enforces a calibrated 130K aggregate
+estimated-token reservation; the same convoy then passed 3/3 with 16.061-second
+control TTFT, 51.5% peak KV, and zero preemptions. Evidence is in
+`admission/phase3-full-admission-report.md` and
+`admission/phase3-mixed-context-report.md`.
 
 ### Phase 4 — Fleet migration
 

@@ -183,6 +183,9 @@ describe('PiAiAdapter provider routing', () => {
     expect(server.requests[0]).toMatchObject({
       class: 'background', tenant: 'session-1', purpose: 'subagent',
     })
+    const estimated = (server.requests[0] as { estimatedInputTokens?: unknown }).estimatedInputTokens
+    expect(typeof estimated).toBe('number')
+    expect(estimated as number).toBeGreaterThan(0)
     const requestId = (server.requests[0] as { requestId?: unknown }).requestId
     expect(requestId).toEqual(expect.any(String))
     expect(server.headers[1]).toMatchObject({

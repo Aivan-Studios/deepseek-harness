@@ -80,6 +80,7 @@ import fcntl
 import hashlib
 import http.client
 import json
+import math
 import os
 import pwd
 import re
@@ -1238,6 +1239,11 @@ PROXY_CLASS_WEIGHTS = {
 }
 PROXY_BACKGROUND_AGE_MS = 120_000
 PROXY_AGENT_AGE_MS = 60_000
+PROXY_ESTIMATED_TOKEN_BUDGET = 130_000
+PROXY_ESTIMATE_BYTES_PER_TOKEN = 3
+PROXY_DEFAULT_OUTPUT_TOKENS = 8_192
+PROXY_MAX_ESTIMATED_TOKENS = 262_144
+PROXY_MAX_TOKEN_BYPASSES = 8
 PROXY_METADATA_MAX_CHARS = 128
 PROXY_SCHEDULING_HEADERS = {
     "x-aivan-work-class", "x-aivan-tenant", "x-aivan-purpose",
@@ -1413,6 +1419,22 @@ def shadow_metadata(path: str, header_lines: list[str], body: bytes) -> dict:
         purpose = "unspecified"
         source = "legacy"
 
+    try:
+        request = json.loads(body)
+    except (UnicodeDecodeError, ValueError):
+        request = {}
+    requested_output = request.get(
+        "max_tokens", request.get("max_completion_tokens",
+                                  PROXY_DEFAULT_OUTPUT_TOKENS)) \
+        if isinstance(request, dict) else PROXY_DEFAULT_OUTPUT_TOKENS
+    if (not isinstance(requested_output, int)
+            or isinstance(requested_output, bool) or requested_output <= 0):
+        requested_output = PROXY_DEFAULT_OUTPUT_TOKENS
+    estimated_input = max(
+        1, math.ceil(len(body) / PROXY_ESTIMATE_BYTES_PER_TOKEN))
+    requested_output = min(requested_output, PROXY_MAX_ESTIMATED_TOKENS)
+    estimated_input = min(estimated_input, PROXY_MAX_ESTIMATED_TOKENS)
+
     tenant = supplied.get("x-aivan-tenant", "legacy")
     if invalid:
         tenant = "legacy"
@@ -1423,6 +1445,9 @@ def shadow_metadata(path: str, header_lines: list[str], body: bytes) -> dict:
             "request_id": supplied.get("x-aivan-request-id"),
             "deadline_ms": (int(deadline) if deadline is not None and not invalid
                             else PROXY_QUEUE_DEADLINES_MS[work_class]),
+            "estimated_input_tokens": estimated_input,
+            "requested_output_tokens": requested_output,
+            "cost_tokens": estimated_input + requested_output,
             "invalid": invalid}
 
 
@@ -1441,6 +1466,7 @@ class AdmissionController:
         self.condition = asyncio.Condition()
         self.active = 0
         self.active_by_class = {name: 0 for name in PROXY_WORK_CLASSES}
+        self.active_estimated_tokens = 0
         self.background_by_tenant: dict[str, int] = {}
         self.queued = 0
         self.queued_by_tenant: dict[str, int] = {}
@@ -1457,6 +1483,15 @@ class AdmissionController:
             return True
         tenant = metadata["tenant_raw"]
         return self.background_by_tenant.get(tenant, 0) < 1
+
+    def _capacity_eligible(self, metadata: dict) -> bool:
+        if self.active >= PROXY_SHADOW_MAX_ACTIVE:
+            return False
+        # One individually large request must remain usable. Once anything is
+        # active, however, retain the calibrated KV headroom rather than
+        # pushing a second long prefill into vLLM's internal capacity queue.
+        return (self.active == 0 or self.active_estimated_tokens
+                + metadata["cost_tokens"] <= PROXY_ESTIMATED_TOKEN_BUDGET)
 
     @staticmethod
     def _effective_class(entry: dict, now: float) -> str:
@@ -1481,8 +1516,22 @@ class AdmissionController:
 
     def _pick_queued(self) -> dict | None:
         now = time.monotonic()
+        bypass_limited = [entry for entry in self.queue
+                          if self._tenant_eligible(entry["metadata"])
+                          and entry["bypasses"] >= PROXY_MAX_TOKEN_BYPASSES]
         eligible = [entry for entry in self.queue
-                    if self._tenant_eligible(entry["metadata"])]
+                    if self._tenant_eligible(entry["metadata"])
+                    and self._capacity_eligible(entry["metadata"])]
+        limited_fit = [entry for entry in bypass_limited
+                       if self._capacity_eligible(entry["metadata"])]
+        if limited_fit:
+            eligible = limited_fit
+        elif bypass_limited:
+            # Once an older request has been backfilled a bounded number of
+            # times, drain toward a state where it fits. Control work retains
+            # its safety lane; other cheap work no longer prolongs starvation.
+            eligible = [entry for entry in eligible
+                        if self._effective_class(entry, now) == "control"]
         if not eligible:
             return None
         grouped = {name: [] for name in PROXY_WORK_CLASSES}
@@ -1508,6 +1557,11 @@ class AdmissionController:
                         candidates[0])
         self.last_tenant_by_class[selected_class] = \
             selected["metadata"]["tenant_raw"]
+        for entry in self.queue:
+            if (entry["sequence"] < selected["sequence"]
+                    and self._tenant_eligible(entry["metadata"])
+                    and not self._capacity_eligible(entry["metadata"])):
+                entry["bypasses"] += 1
         return selected
 
     def _dispatch(self) -> None:
@@ -1525,6 +1579,7 @@ class AdmissionController:
     def _occupy(self, metadata: dict) -> None:
         self.active += 1
         self.active_by_class[metadata["class"]] += 1
+        self.active_estimated_tokens += metadata["cost_tokens"]
         if metadata["class"] == "background":
             tenant = metadata["tenant_raw"]
             self.background_by_tenant[tenant] = \
@@ -1535,6 +1590,8 @@ class AdmissionController:
         work_class = metadata["class"]
         self.active_by_class[work_class] = max(
             0, self.active_by_class[work_class] - 1)
+        self.active_estimated_tokens = max(
+            0, self.active_estimated_tokens - metadata["cost_tokens"])
         if metadata["class"] == "background":
             tenant = metadata["tenant_raw"]
             remaining = self.background_by_tenant.get(tenant, 0) - 1
@@ -1551,7 +1608,7 @@ class AdmissionController:
                       PROXY_QUEUE_DEADLINES_MS[metadata["class"]]) / 1000
         entry = None
         async with self.condition:
-            if (self.active < PROXY_SHADOW_MAX_ACTIVE and not self.queue
+            if (self._capacity_eligible(metadata) and not self.queue
                     and self._tenant_eligible(metadata)):
                 self._occupy(metadata)
                 return (time.monotonic() - started) * 1000
@@ -1571,7 +1628,7 @@ class AdmissionController:
                 entry = {"metadata": metadata, "body_bytes": body_bytes,
                          "enqueued_at": started, "sequence": self.sequence,
                          "future": asyncio.get_running_loop().create_future(),
-                         "admitted": False}
+                         "admitted": False, "bypasses": 0}
                 self.queue.append(entry)
                 self._dispatch()
         try:
@@ -1621,6 +1678,8 @@ class AdmissionController:
                 "active": self.active,
                 "maxActive": PROXY_SHADOW_MAX_ACTIVE,
                 "activeByClass": dict(self.active_by_class),
+                "activeEstimatedTokens": self.active_estimated_tokens,
+                "maxEstimatedTokens": PROXY_ESTIMATED_TOKEN_BUDGET,
                 "queued": self.queued,
                 "maxQueued": PROXY_MAX_QUEUED,
                 "queuedByClass": queued_by_class,
@@ -1634,7 +1693,8 @@ class AdmissionController:
     def _acquire_signature(metadata: dict) -> tuple:
         return (metadata["class"], metadata["tenant_raw"],
                 metadata["request_id"], metadata["purpose"],
-                metadata["deadline_ms"])
+                metadata["deadline_ms"], metadata["estimated_input_tokens"],
+                metadata["requested_output_tokens"])
 
     async def _issue_permit(self, metadata: dict,
                             key: tuple[str, str]) -> tuple[str, float, int]:
@@ -1862,11 +1922,24 @@ def acquire_metadata(body: bytes) -> dict:
                            PROXY_QUEUE_DEADLINES_MS[work_class])
     if not isinstance(deadline, int) or isinstance(deadline, bool) or deadline <= 0:
         raise ValueError("admission acquire deadlineMs is invalid")
+    estimated_input = request.get("estimatedInputTokens",
+                                  PROXY_ESTIMATED_TOKEN_BUDGET)
+    requested_output = request.get("requestedOutputTokens",
+                                   PROXY_DEFAULT_OUTPUT_TOKENS)
+    for name, value in (("estimatedInputTokens", estimated_input),
+                        ("requestedOutputTokens", requested_output)):
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value <= 0 or value > PROXY_MAX_ESTIMATED_TOKENS):
+            raise ValueError(f"admission acquire {name} is invalid")
     tenant_digest = hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:12]
     return {"class": work_class, "purpose": purpose,
             "source": "acquire", "tenant": tenant_digest,
             "tenant_raw": tenant, "request_id": request_id,
-            "deadline_ms": deadline, "invalid": False}
+            "deadline_ms": deadline,
+            "estimated_input_tokens": estimated_input,
+            "requested_output_tokens": requested_output,
+            "cost_tokens": estimated_input + requested_output,
+            "invalid": False}
 
 
 async def proxy_json(writer, status: int, payload: dict) -> None:
@@ -4516,11 +4589,17 @@ def case_proxy_admission_shadow(_tmp: Path) -> None:
 def case_proxy_admission_phase2(_tmp: Path) -> None:
     """Weighted admission, permits, expiry, and cancellation release slots."""
     def metadata(work_class: str, tenant: str, request_id: str,
-                 deadline_ms: int = 1000) -> dict:
+                 deadline_ms: int = 1000,
+                 estimated_input_tokens: int = 1000,
+                 requested_output_tokens: int = 128) -> dict:
         return {"class": work_class, "purpose": "selftest",
                 "source": "explicit", "tenant": tenant,
                 "tenant_raw": tenant, "request_id": request_id,
-                "deadline_ms": deadline_ms, "invalid": False}
+                "deadline_ms": deadline_ms,
+                "estimated_input_tokens": estimated_input_tokens,
+                "requested_output_tokens": requested_output_tokens,
+                "cost_tokens": estimated_input_tokens + requested_output_tokens,
+                "invalid": False}
 
     async def exercise() -> None:
         controller = AdmissionController()
@@ -4651,6 +4730,9 @@ def case_proxy_admission_phase2(_tmp: Path) -> None:
         state = await scheduler.snapshot()
         check(state["active"] == 2 and state["queued"] == 3
               and state["activeByClass"]["agent"] == 2
+              and state["activeEstimatedTokens"] == 2256
+              and state["maxEstimatedTokens"]
+              == PROXY_ESTIMATED_TOKEN_BUDGET
               and state["queuedByClass"] == {
                   "control": 0, "interactive": 1,
                   "agent": 1, "background": 1,
@@ -4678,6 +4760,36 @@ def case_proxy_admission_phase2(_tmp: Path) -> None:
         await scheduler.release(hold_two)
         check(scheduler.active == 0 and scheduler.queued == 0,
               "weighted scheduler leaked active or queued work")
+
+        token_scheduler = AdmissionController()
+        large = metadata("background", "large-one", "large-one",
+                         estimated_input_tokens=90_000,
+                         requested_output_tokens=128)
+        waiting_large = metadata("background", "large-two", "large-two",
+                                 estimated_input_tokens=70_000,
+                                 requested_output_tokens=128)
+        small_control = metadata("control", "control", "small-control",
+                                 estimated_input_tokens=2_000,
+                                 requested_output_tokens=128)
+        await token_scheduler.enter(large)
+        large_task = asyncio.create_task(token_scheduler.enter(waiting_large))
+        await asyncio.sleep(0)
+        check(not large_task.done() and token_scheduler.active == 1,
+              "token budget admitted an unsafe aggregate context")
+        control_task = asyncio.create_task(token_scheduler.enter(small_control))
+        await control_task
+        check(token_scheduler.active == 2
+              and token_scheduler.active_by_class["control"] == 1,
+              "small control work did not backfill token headroom")
+        await token_scheduler.release(small_control)
+        check(not large_task.done(),
+              "large queued work exceeded token headroom after control")
+        await token_scheduler.release(large)
+        await large_task
+        await token_scheduler.release(waiting_large)
+        check(token_scheduler.active == 0
+              and token_scheduler.active_estimated_tokens == 0,
+              "token-aware admission leaked estimated capacity")
 
         tenant_scheduler = AdmissionController()
         tenant_one = metadata("background", "tenant-one", "tenant-one")
